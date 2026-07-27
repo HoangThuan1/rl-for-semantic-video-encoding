@@ -27,12 +27,20 @@ TAI SAO LAM THEO DOAN (SEGMENT), KHONG PHAI TUNG FRAME:
   huan luyen offline.
 
 CACH DUNG:
-  python3 encode_grid_roi.py --input dataset/videos/xxx.mp4 \
-      --yolo-metadata outputs/metadata/yolo_metadata.jsonl \
-      --out outputs/metadata/vcu_encode_grid_roi.json \
-      --baseline-qp 30 --segment-frames 25
+  # Chay tu thu muc cnn_training/rl_env_offline.
+  python3 encode_grid.py --input ../dataset/videos/xxx.mp4 \
+      --yolo-metadata ../outputs/metadata/yolo_metadata.jsonl \
+      --out ../outputs/metadata/vcu_encode_grid_roi.json \
+      --baseline-crf 28 --segment-frames 25 --workers 4 --metrics vmaf
 
-KET QUA: file JSON, grid["res{i}_qp{j}"][frame_idx] = {bitrate_kbps, vmaf, psnr}
+  # Smoke test toc do/pipeline, KHONG nen dung de train reward VMAF:
+  python3 encode_grid.py --input ../dataset/videos/xxx.mp4 \
+      --yolo-metadata ../outputs/metadata/yolo_metadata.jsonl \
+      --out /tmp/vcu_encode_grid_smoke.json \
+      --segment-frames 50 --workers 4 --metrics none --preset ultrafast
+
+KET QUA: file JSON, grid["res{i}_qp{j}"][frame_idx] = {bitrate_kbps, vmaf}
+  Neu chay --metrics vmaf,psnr thi moi row co them field psnr.
   -- giu NGUYEN cau truc nhu encode_grid.py de load_encode_grid()/env.py
   dung lai duoc, chi khac o CHO "qp{j}" gio la MUC DO ROI (qoffset), khong
   phai QP tuyet doi -- xem "roi_qoffset_levels" va "baseline_qp" trong file
@@ -40,6 +48,7 @@ KET QUA: file JSON, grid["res{i}_qp{j}"][frame_idx] = {bitrate_kbps, vmaf, psnr}
 """
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import os
 import subprocess
@@ -47,8 +56,8 @@ import sys
 import tempfile
 
 RESOLUTIONS = [(640, 480), (1280, 720), (1920, 1080)]
-YOLO_METADATA = "outputs/metadata/yolo_metadata.jsonl"
-ENCODE_GRID = "outputs/metadata/vcu_encode_grid_roi.json"
+YOLO_METADATA = "../outputs/metadata/yolo_metadata.jsonl"
+ENCODE_GRID = "../outputs/metadata/vcu_encode_grid_roi.json"
 
 # Muc do "ROI QP" cho grid encode offline, gio la ROI qoffset chu khong
 # phai QP tuyet doi nua: 0.0 = khong uu tien vung ROI (giong CBR thuong),
@@ -57,8 +66,9 @@ ENCODE_GRID = "outputs/metadata/vcu_encode_grid_roi.json"
 ROI_QOFFSET_LEVELS = [0.0, -0.3, -0.6]
 
 
-def run(cmd):
-    print("  $", " ".join(str(c) for c in cmd), file=sys.stderr)
+def run(cmd, verbose=True):
+    if verbose:
+        print("  $", " ".join(str(c) for c in cmd), file=sys.stderr)
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
@@ -132,8 +142,13 @@ def union_roi_for_segment(yolo_by_frame, start_frame, end_frame, src_w, src_h,
     return x1, y1, w, h
 
 
+def frame_time(frame_idx, fps):
+    return f"{frame_idx / fps:.6f}"
+
+
 def encode_segment(input_path, start_frame, end_frame, width, height, roi_box,
-                    qoffset, baseline_crf, fps, workdir, tag):
+                    qoffset, baseline_crf, fps, workdir, tag, preset="veryfast",
+                    seek_mode="fast", verbose=True):
     """Encode 1 doan [start_frame, end_frame) o do phan giai (width,height).
 
     QUAN TRONG: dung CRF (rate-control chu dong), KHONG dung constant-QP
@@ -145,39 +160,53 @@ def encode_segment(input_path, start_frame, end_frame, width, height, roi_box,
     (da kiem chung: doi qoffset tu 0 -> -0.9 tren noi dung phuc tap lam
     dung luong file tang ~5 lan trong vung ROI)."""
     out_path = os.path.join(workdir, f"seg_{tag}_{start_frame}_{end_frame}.mp4")
-    select_expr = f"between(n\\,{start_frame}\\,{end_frame - 1})"
-    vf = f"select='{select_expr}',setpts=N/FRAME_RATE/TB,scale={width}:{height}:flags=bicubic"
+    frame_count = max(1, end_frame - start_frame)
+    vf = f"scale={width}:{height}:flags=bicubic"
     if roi_box is not None:
         x, y, w, h = roi_box
         vf += f",addroi=x={x}:y={y}:w={w}:h={h}:qoffset={qoffset}"
 
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
+    cmd = ["ffmpeg", "-y"]
+    if seek_mode == "fast":
+        cmd += ["-ss", frame_time(start_frame, fps)]
+    cmd += ["-i", input_path]
+    if seek_mode == "accurate":
+        cmd += ["-ss", frame_time(start_frame, fps)]
+    cmd += [
         "-vf", vf,
-        "-c:v", "libx264", "-crf", str(baseline_crf),
-        "-bf", "0", "-g", str(max(1, end_frame - start_frame)),
+        "-frames:v", str(frame_count),
+        "-an",
+        "-c:v", "libx264", "-preset", preset, "-crf", str(baseline_crf),
+        "-bf", "0", "-g", str(frame_count),
         "-r", f"{fps:.6f}", "-vsync", "cfr", "-pix_fmt", "yuv420p",
         "-loglevel", "error", out_path,
     ]
-    run(cmd)
+    run(cmd, verbose=verbose)
     return out_path
 
 
 def extract_reference_segment(input_path, start_frame, end_frame, orig_w, orig_h,
-                               fps, workdir, tag):
+                               fps, workdir, tag, preset="ultrafast",
+                               seek_mode="fast", verbose=True):
     """Cat dung doan [start_frame,end_frame) TU VIDEO GOC (khong nen), giu
     nguyen do phan giai goc, dung lam reference tinh PSNR cho doan encode
     tuong ung (dam bao 2 ben cung so frame/thu tu)."""
     out_path = os.path.join(workdir, f"ref_{tag}_{start_frame}_{end_frame}.mp4")
-    select_expr = f"between(n\\,{start_frame}\\,{end_frame - 1})"
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB",
-        "-c:v", "libx264", "-qp", "0",  # nen lossless -- chi dung lam reference, khong tinh bitrate
+    frame_count = max(1, end_frame - start_frame)
+    cmd = ["ffmpeg", "-y"]
+    if seek_mode == "fast":
+        cmd += ["-ss", frame_time(start_frame, fps)]
+    cmd += ["-i", input_path]
+    if seek_mode == "accurate":
+        cmd += ["-ss", frame_time(start_frame, fps)]
+    cmd += [
+        "-frames:v", str(frame_count),
+        "-an",
+        "-c:v", "libx264", "-preset", preset, "-qp", "0",  # nen lossless -- chi dung lam reference, khong tinh bitrate
         "-r", f"{fps:.6f}", "-vsync", "cfr", "-pix_fmt", "yuv420p",
         "-loglevel", "error", out_path,
     ]
-    run(cmd)
+    run(cmd, verbose=verbose)
     return out_path
 
 
@@ -196,7 +225,8 @@ def ffmpeg_filter_path(path):
     return path.replace("\\", "/").replace(":", "\\:")
 
 
-def extract_vmaf_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir, tag):
+def extract_vmaf_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir,
+                           tag, verbose=True):
     log_path = os.path.join(workdir, f"vmaf_{tag}.json")
     cmd = [
         "ffmpeg", "-y", "-i", encoded_path, "-i", reference_path,
@@ -206,7 +236,7 @@ def extract_vmaf_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir
         "-f", "null", "-", "-loglevel", "error",
     ]
     try:
-        run(cmd)
+        run(cmd, verbose=verbose)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             "Khong tinh duoc VMAF. Hay dung ffmpeg co filter libvmaf "
@@ -224,7 +254,8 @@ def extract_vmaf_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir
     return vmafs
 
 
-def extract_psnr_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir, tag):
+def extract_psnr_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir,
+                           tag, verbose=True):
     log_path = os.path.join(workdir, f"psnr_{tag}.log")
     cmd = [
         "ffmpeg", "-y", "-i", encoded_path, "-i", reference_path,
@@ -233,7 +264,7 @@ def extract_psnr_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir
         f"[enc][1:v]psnr=stats_file={ffmpeg_filter_path(log_path)}",
         "-f", "null", "-", "-loglevel", "error",
     ]
-    run(cmd)
+    run(cmd, verbose=verbose)
     psnrs = []
     with open(log_path, "r") as f:
         for line in f:
@@ -243,8 +274,101 @@ def extract_psnr_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir
     return psnrs
 
 
+def _build_ref_worker(args):
+    (
+        input_path,
+        start_f,
+        end_f,
+        orig_w,
+        orig_h,
+        fps,
+        workdir,
+        si,
+        preset,
+        seek_mode,
+        verbose,
+    ) = args
+    ref_path = extract_reference_segment(
+        input_path, start_f, end_f, orig_w, orig_h, fps, workdir,
+        f"ref_s{si}", preset=preset, seek_mode=seek_mode, verbose=verbose
+    )
+    return si, ref_path
+
+
+def _grid_segment_worker(args):
+    (
+        input_path,
+        ref_path,
+        start_f,
+        end_f,
+        fps,
+        orig_w,
+        orig_h,
+        width,
+        height,
+        roi_box,
+        qoffset,
+        baseline_crf,
+        workdir,
+        key,
+        si,
+        res_idx,
+        qp_idx,
+        metrics,
+        preset,
+        seek_mode,
+        verbose,
+        keep_files,
+    ) = args
+
+    tag = f"r{res_idx}q{qp_idx}s{si}"
+    enc_path = encode_segment(
+        input_path, start_f, end_f, width, height, roi_box, qoffset,
+        baseline_crf, fps, workdir, tag, preset=preset,
+        seek_mode=seek_mode, verbose=verbose
+    )
+    try:
+        bitrates = extract_bitrate_per_frame(enc_path, fps)
+
+        if "vmaf" in metrics:
+            vmafs = extract_vmaf_per_frame(
+                enc_path, ref_path, orig_w, orig_h, workdir, tag, verbose=verbose
+            )
+        else:
+            vmafs = [0.0] * len(bitrates)
+
+        psnrs = None
+        if "psnr" in metrics:
+            psnrs = extract_psnr_per_frame(
+                enc_path, ref_path, orig_w, orig_h, workdir, tag, verbose=verbose
+            )
+
+        n = min(len(bitrates), len(vmafs), end_f - start_f)
+        if psnrs is not None:
+            n = min(n, len(psnrs))
+
+        rows = []
+        for i in range(n):
+            row = {
+                "bitrate_kbps": round(bitrates[i], 2),
+                "vmaf": round(vmafs[i], 2),
+            }
+            if psnrs is not None:
+                row["psnr"] = round(psnrs[i], 2)
+            rows.append(row)
+        return key, si, rows
+    finally:
+        if not keep_files:
+            try:
+                os.remove(enc_path)
+            except OSError:
+                pass
+
+
 def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
-                keep_files=False, workdir=None):
+                keep_files=False, workdir=None, workers=1, metrics=("vmaf",),
+                preset="veryfast", ref_preset="ultrafast", seek_mode="fast",
+                verbose=False):
     fps, orig_w, orig_h, nb_frames = probe_video(input_path)
     yolo_by_frame = load_yolo_metadata(yolo_metadata_path)
     print(f"[info] input: {input_path} | {orig_w}x{orig_h}@{fps:.3f}fps | "
@@ -252,50 +376,127 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
           f"(~{segment_frames/fps:.2f}s)", file=sys.stderr)
     print(f"[info] ROI qoffset levels: {ROI_QOFFSET_LEVELS} | baseline_crf={baseline_crf}",
           file=sys.stderr)
+    print(f"[info] workers={workers} | metrics={','.join(metrics) or 'none'} | "
+          f"preset={preset} | seek_mode={seek_mode}", file=sys.stderr)
 
     tmp_ctx = tempfile.TemporaryDirectory() if workdir is None else None
     wd = workdir or tmp_ctx.name
     os.makedirs(wd, exist_ok=True)
 
     boundaries = list(range(0, nb_frames, segment_frames)) + [nb_frames]
+    segments = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
+    roi_cache = {}
+    for res_idx, (w, h) in enumerate(RESOLUTIONS):
+        for si, (start_f, end_f) in enumerate(segments):
+            roi_cache[(res_idx, si)] = union_roi_for_segment(
+                yolo_by_frame, start_f, end_f, orig_w, orig_h, w, h
+            )
 
     grid = {}
+    ref_paths = {}
     try:
-        for res_idx, (w, h) in enumerate(RESOLUTIONS):
-            for qp_idx, qoffset in enumerate(ROI_QOFFSET_LEVELS):
-                key = f"res{res_idx}_qp{qp_idx}"
-                print(f"[encode] {key}: {w}x{h} | roi_qoffset={qoffset}", file=sys.stderr)
-                rows = []
-                for si in range(len(boundaries) - 1):
-                    start_f, end_f = boundaries[si], boundaries[si + 1]
-                    tag = f"r{res_idx}q{qp_idx}s{si}"
+        if metrics:
+            print(f"[ref] tao {len(segments)} reference segments mot lan de dung lai",
+                  file=sys.stderr)
+            ref_tasks = [
+                (
+                    input_path, start_f, end_f, orig_w, orig_h, fps, wd, si,
+                    ref_preset, seek_mode, verbose,
+                )
+                for si, (start_f, end_f) in enumerate(segments)
+            ]
+            if workers > 1:
+                with ProcessPoolExecutor(max_workers=workers) as ex:
+                    futures = [ex.submit(_build_ref_worker, task) for task in ref_tasks]
+                    for done, fut in enumerate(as_completed(futures), 1):
+                        si, ref_path = fut.result()
+                        ref_paths[si] = ref_path
+                        if done % 25 == 0 or done == len(futures):
+                            print(f"[ref] {done}/{len(futures)}", file=sys.stderr)
+            else:
+                for done, task in enumerate(ref_tasks, 1):
+                    si, ref_path = _build_ref_worker(task)
+                    ref_paths[si] = ref_path
+                    if done % 25 == 0 or done == len(ref_tasks):
+                        print(f"[ref] {done}/{len(ref_tasks)}", file=sys.stderr)
 
-                    roi_box = union_roi_for_segment(
-                        yolo_by_frame, start_f, end_f, orig_w, orig_h, w, h
+        for res_idx, (w, h) in enumerate(RESOLUTIONS):
+            for qp_idx, _ in enumerate(ROI_QOFFSET_LEVELS):
+                grid[f"res{res_idx}_qp{qp_idx}"] = []
+
+        tasks = []
+        copy_from_base = []
+        for res_idx, (w, h) in enumerate(RESOLUTIONS):
+            for si, (start_f, end_f) in enumerate(segments):
+                roi_box = roi_cache[(res_idx, si)]
+                for qp_idx, qoffset in enumerate(ROI_QOFFSET_LEVELS):
+                    key = f"res{res_idx}_qp{qp_idx}"
+                    if roi_box is None and qp_idx > 0:
+                        copy_from_base.append((key, f"res{res_idx}_qp0", si))
+                        continue
+                    tasks.append(
+                        (
+                            input_path,
+                            ref_paths.get(si),
+                            start_f,
+                            end_f,
+                            fps,
+                            orig_w,
+                            orig_h,
+                            w,
+                            h,
+                            roi_box,
+                            qoffset,
+                            baseline_crf,
+                            wd,
+                            key,
+                            si,
+                            res_idx,
+                            qp_idx,
+                            metrics,
+                            preset,
+                            seek_mode,
+                            verbose,
+                            keep_files,
+                        )
                     )
-                    enc_path = encode_segment(
-                        input_path, start_f, end_f, w, h, roi_box, qoffset,
-                        baseline_crf, fps, wd, tag
-                    )
-                    ref_path = extract_reference_segment(
-                        input_path, start_f, end_f, orig_w, orig_h, fps, wd, tag
-                    )
-                    bitrates = extract_bitrate_per_frame(enc_path, fps)
-                    vmafs = extract_vmaf_per_frame(enc_path, ref_path, orig_w, orig_h, wd, tag)
-                    psnrs = extract_psnr_per_frame(enc_path, ref_path, orig_w, orig_h, wd, tag)
-                    n = min(len(bitrates), len(vmafs), len(psnrs), end_f - start_f)
-                    for i in range(n):
-                        rows.append({"bitrate_kbps": round(bitrates[i], 2),
-                                     "vmaf": round(vmafs[i], 2),
-                                     "psnr": round(psnrs[i], 2)})
-                    if not keep_files:
-                        for p in (enc_path, ref_path):
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                pass
+
+        print(f"[encode] {len(tasks)} jobs encode/metric "
+              f"(bo qua {len(copy_from_base)} jobs trung lap do segment khong co ROI)",
+              file=sys.stderr)
+        segment_rows = {}
+        if workers > 1:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futures = [ex.submit(_grid_segment_worker, task) for task in tasks]
+                for done, fut in enumerate(as_completed(futures), 1):
+                    key, si, rows = fut.result()
+                    segment_rows[(key, si)] = rows
+                    if done % 25 == 0 or done == len(futures):
+                        print(f"[encode] {done}/{len(futures)}", file=sys.stderr)
+        else:
+            for done, task in enumerate(tasks, 1):
+                key, si, rows = _grid_segment_worker(task)
+                segment_rows[(key, si)] = rows
+                if done % 25 == 0 or done == len(tasks):
+                    print(f"[encode] {done}/{len(tasks)}", file=sys.stderr)
+
+        for key, base_key, si in copy_from_base:
+            segment_rows[(key, si)] = list(segment_rows[(base_key, si)])
+
+        for res_idx, _ in enumerate(RESOLUTIONS):
+            for qp_idx, _ in enumerate(ROI_QOFFSET_LEVELS):
+                key = f"res{res_idx}_qp{qp_idx}"
+                rows = []
+                for si in range(len(segments)):
+                    rows.extend(segment_rows[(key, si)])
                 grid[key] = rows
     finally:
+        if metrics and not keep_files:
+            for ref_path in ref_paths.values():
+                try:
+                    os.remove(ref_path)
+                except OSError:
+                    pass
         if tmp_ctx is not None:
             tmp_ctx.cleanup()
 
@@ -307,11 +508,28 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
         "resolutions": RESOLUTIONS,
         "roi_qoffset_levels": ROI_QOFFSET_LEVELS,
         "baseline_crf": baseline_crf,
+        "metrics": list(metrics),
+        "encode_preset": preset,
+        "seek_mode": seek_mode,
         "min_qp": baseline_crf,   # giu ten khop voi env.py cu (fallback, khong dung de tra QP tuyet doi nua)
         "max_qp": baseline_crf,
         "qp_levels": ROI_QOFFSET_LEVELS,  # ten cu, gio la qoffset -- xem "roi_qoffset_levels" cho ro nghia
         "grid": grid,
     }
+
+
+def parse_metrics(value):
+    value = value.strip().lower()
+    if value in {"none", "off", "no"}:
+        return ()
+    metrics = tuple(part.strip() for part in value.split(",") if part.strip())
+    allowed = {"vmaf", "psnr"}
+    unknown = sorted(set(metrics) - allowed)
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"metrics khong hop le: {','.join(unknown)}. Chi ho tro: vmaf,psnr,none"
+        )
+    return metrics
 
 
 def main():
@@ -330,22 +548,40 @@ def main():
                      help="So frame moi doan (ROI tinh trong 1 doan). 25 ~ 1s o 25fps")
     ap.add_argument("--keep-files", action="store_true")
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--workers", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)),
+                     help="So job ffmpeg chay song song. Goi y: 2-4 tren may laptop, "
+                          "cao hon neu CPU/SSD manh.")
+    ap.add_argument("--metrics", type=parse_metrics, default=("vmaf",),
+                     help="Metric can tinh: 'vmaf' (mac dinh), 'vmaf,psnr', hoac 'none'. "
+                          "Env/reward chi can VMAF, nen bo PSNR se nhanh hon dang ke.")
+    ap.add_argument("--preset", default="veryfast",
+                     help="libx264 preset cho encode grid. Doi sang ultrafast neu can nhanh hon.")
+    ap.add_argument("--ref-preset", default="ultrafast",
+                     help="libx264 preset cho reference lossless segment.")
+    ap.add_argument("--seek-mode", choices=("fast", "accurate"), default="fast",
+                     help="'fast' dung -ss truoc input de xu ly video dai nhanh hon; "
+                          "'accurate' cham hon nhung bam frame chinh xac hon.")
+    ap.add_argument("--verbose-ffmpeg", action="store_true",
+                     help="In tung lenh ffmpeg. Mac dinh tat de log gon khi chay video dai.")
     args = ap.parse_args()
 
     input_path = args.input
     yolo_metadata_path = args.yolo_metadata
     out_path = args.out
+    workdir = args.workdir
 
     result = build_grid(input_path, yolo_metadata_path, args.baseline_crf,
                          args.segment_frames, keep_files=args.keep_files,
-                         workdir=args.workdir)
+                         workdir=workdir, workers=max(1, args.workers),
+                         metrics=args.metrics, preset=args.preset,
+                         ref_preset=args.ref_preset, seek_mode=args.seek_mode,
+                         verbose=args.verbose_ffmpeg)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"\n[done] Da luu luoi encode ROI vao: {args.out}", file=sys.stderr)
+    print(f"\n[done] Da luu luoi encode ROI vao: {out_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
     main()
-
