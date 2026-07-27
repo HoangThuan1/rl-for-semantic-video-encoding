@@ -2,7 +2,7 @@
 NOTE THIET KE:
 Env nay dung state gon cho Semantic-aware Bitrate Control:
   [bandwidth, prev_bitrate, semantic_score].
-Reward theo cong thuc R = w1 * VMAF_norm - bitrate_used / bitrate_max.
+Reward theo cong thuc R = 0.6 * QoE_norm - 0.4 * bitrate_cost.
 Action duoc roi rac hoa de hop voi DQN va duoc "sanitize" truoc khi dua vao
 surrogate VCU, tranh de policy xung dot voi rate control cap thap cua encoder.
 Resolution duoc xem la quyet dinh cap segment/GOP, khong phai thay tung frame.
@@ -27,7 +27,8 @@ SEMANTIC_SCORE_MAX = 30.0
 MOTION_MAX = 1.0
 ROI_AREA_MAX = 1.0
 LATENCY_BUDGET_MS = 40.0
-DEFAULT_VMAF_WEIGHT = 1.0
+DEFAULT_QOE_WEIGHT = 0.60
+DEFAULT_BITRATE_COST_WEIGHT = 0.40
 DEFAULT_METADATA_DIR = "outputs/metadata"
 DEFAULT_TRACE_PATH = "outputs/metadata/rl_states.jsonl"
 DEFAULT_YOLO_METADATA_PATH = "outputs/metadata/yolo_metadata.jsonl"
@@ -215,7 +216,8 @@ class VCUSimEnv(gym.Env):
         loop=False,
         encode_grid_path=None,
         segment_len=8,
-        vmaf_weight=DEFAULT_VMAF_WEIGHT,
+        qoe_weight=DEFAULT_QOE_WEIGHT,
+        bitrate_cost_weight=DEFAULT_BITRATE_COST_WEIGHT,
     ):
         super().__init__()
         resolved_trace_path = trace_path
@@ -235,7 +237,8 @@ class VCUSimEnv(gym.Env):
         self.max_qp = float(max_qp)
         self.loop = loop
         self.segment_len = max(1, int(segment_len))
-        self.vmaf_weight = float(vmaf_weight)
+        self.qoe_weight = float(qoe_weight)
+        self.bitrate_cost_weight = float(bitrate_cost_weight)
 
         self.grid = load_encode_grid(encode_grid_path) if encode_grid_path else None
         self.grid_qp_levels = self.grid.get("qp_levels") if self.grid else None
@@ -339,13 +342,13 @@ class VCUSimEnv(gym.Env):
         bitrate_ratio = min(action.bitrate_ratio, 0.95)
         resolution_idx = action.resolution_idx
 
-        if bandwidth < 400.0:
-            resolution_idx = min(resolution_idx, 0)
+        if bandwidth < 300.0:
+            resolution_idx = min(resolution_idx, 1)
             bitrate_ratio = min(bitrate_ratio, 0.75)
-        elif bandwidth < 2000.0:
+        elif bandwidth < 900.0:
             resolution_idx = min(resolution_idx, 1)
 
-        if semantic_score > 0.65 * SEMANTIC_SCORE_MAX and bandwidth > 1500.0:
+        if semantic_score > 0.85 * SEMANTIC_SCORE_MAX and bandwidth > 2500.0:
             resolution_idx = max(resolution_idx, 1)
 
         # Model resolution as a segment/GOP-level decision to avoid rapid reconfigure.
@@ -395,13 +398,16 @@ class VCUSimEnv(gym.Env):
         raise KeyError("Encode grid thieu field 'vmaf'. Hay chay lai encode_grid.py de tao grid VMAF.")
 
     def _compute_reward(self, vmaf, actual_bitrate):
-        vmaf_norm = np.clip(vmaf / 100.0, 0.0, 1.0)
+        qoe_norm = np.clip(vmaf / 100.0, 0.0, 1.0)
         bitrate_cost = actual_bitrate / self.max_bitrate
-        reward = self.vmaf_weight * vmaf_norm - bitrate_cost
+        reward = self.qoe_weight * qoe_norm - self.bitrate_cost_weight * bitrate_cost
 
         return float(reward), {
-            "vmaf_norm": float(vmaf_norm),
+            "qoe_norm": float(qoe_norm),
+            "vmaf_norm": float(qoe_norm),
             "bitrate_cost": float(bitrate_cost),
+            "qoe_reward_term": float(self.qoe_weight * qoe_norm),
+            "bitrate_penalty_term": float(self.bitrate_cost_weight * bitrate_cost),
         }
 
     def _infer_motion(self):
@@ -425,4 +431,3 @@ if __name__ == "__main__":
         total_reward += reward
         steps += 1
     print(f"Ran {steps} steps, random-policy total reward: {total_reward:.3f}")
-
