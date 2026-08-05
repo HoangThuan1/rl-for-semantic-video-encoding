@@ -7,7 +7,7 @@ dung. Khop dung interface hien tai cua env.py/train.py:
   - Action: index roi rac (int) vao env.action_space (Discrete), KHONG con
     la vector continuous nhu ban thiet ke truoc -- env.step(action_idx) nhan
     thang int.
-  - env.decode_action(idx) -> EncoderAction(bitrate_ratio, resolution_idx)
+  - env.decode_action(idx) -> EncoderAction(bitrate_ratio, resolution_idx, roi_idx)
   - checkpoint la 1 dict (torch.save(...)), khong phai state_dict truc tiep.
 
 Tra loi 2 cau hoi:
@@ -27,7 +27,7 @@ import os
 import numpy as np
 import torch
 
-from env import ACTIONS, DEFAULT_TRACE_PATH, VCUSimEnv
+from env import ACTIONS, DEFAULT_TRACE_PATH, ROI_QOFFSET_LEVELS, VCUSimEnv
 from train import QNetwork
 
 
@@ -61,11 +61,11 @@ def make_random_policy(rng, num_actions):
 
 
 def make_cbr_policy(num_actions):
-    """Tim action_idx gan nhat voi (bitrate_ratio~0.75, resolution_idx=1)
-    tuc 720p va GIU CO DINH -- baseline "khong AI"."""
-    target = np.array([0.75, 1.0])
+    """Tim action gan (bitrate_ratio~0.75, resolution_idx=1, roi_idx=0),
+    tuc 720p, khong ROI va GIU CO DINH -- baseline "khong AI"."""
+    target = np.array([0.75, 1.0, 0.0])
     diffs = [
-        np.sum((np.array([a.bitrate_ratio, a.resolution_idx]) - target) ** 2)
+        np.sum((np.array([a.bitrate_ratio, a.resolution_idx, a.roi_idx]) - target) ** 2)
         for a in ACTIONS[:num_actions]
     ]
     fixed_idx = int(np.argmin(diffs))
@@ -79,6 +79,7 @@ def run_episode(env, choose_action_fn):
     bitrates, vmafs, powers, latencies = [], [], [], []
     overflow_steps = 0
     action_counts = np.zeros(env.NUM_ACTIONS, dtype=int)
+    roi_counts = np.zeros(len(ROI_QOFFSET_LEVELS), dtype=int)
     steps = 0
 
     while not done:
@@ -88,6 +89,7 @@ def run_episode(env, choose_action_fn):
 
         next_state, reward, terminated, truncated, info = env.step(action_idx)
         done = terminated or truncated
+        roi_counts[info["roi_idx"]] += 1
 
         total_reward += reward
         bitrates.append(info["actual_bitrate"])
@@ -110,6 +112,7 @@ def run_episode(env, choose_action_fn):
         "avg_latency_ms": float(np.mean(latencies)),
         "overflow_rate": overflow_steps / max(steps, 1),
         "action_counts": action_counts,
+        "roi_counts": roi_counts,
     }
 
 
@@ -134,6 +137,15 @@ def print_comparison(results):
     print("-" * len(line))
     for r in rows:
         print(" | ".join(c.ljust(w) for c, w in zip(r, widths)))
+    print("\nTy le ROI level thuc su sau sanitize:")
+    for name, metrics in results.items():
+        counts = np.asarray(metrics["roi_counts"], dtype=np.float64)
+        percentages = 100.0 * counts / max(float(np.sum(counts)), 1.0)
+        detail = ", ".join(
+            f"roi{idx}({ROI_QOFFSET_LEVELS[idx]}): {pct:.1f}%"
+            for idx, pct in enumerate(percentages)
+        )
+        print(f"  {name}: {detail}")
 
 
 def check_convergence(rewards_path, plot_out=None):
@@ -205,7 +217,8 @@ def main():
         raise ValueError(
             "Policy/checkpoint khong khop env hien tai: "
             f"policy num_actions={num_actions}, env num_actions={env.NUM_ACTIONS}. "
-            "Env hien tai dung action bitrate_ratio x resolution_idx; can train lai policy."
+            "Env hien tai dung action bitrate_ratio x resolution_idx x roi_idx; "
+            "can train lai policy."
         )
     greedy_result = run_episode(env, make_greedy_policy(qnet))
 
@@ -217,8 +230,11 @@ def main():
     rng = _random.Random(args.seed)
     random_runs = [run_episode(env, make_random_policy(rng, num_actions)) for _ in range(args.random_runs)]
     random_result = {
-        k: (np.mean([r[k] for r in random_runs]) if k != "action_counts"
-            else sum(r["action_counts"] for r in random_runs))
+        k: (
+            sum(r[k] for r in random_runs)
+            if k in {"action_counts", "roi_counts"}
+            else np.mean([r[k] for r in random_runs])
+        )
         for k in random_runs[0]
     }
 
@@ -239,4 +255,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -13,18 +13,18 @@ import/tai su dung TRUC TIEP tu code hien co cua ban, khong doan:
   - Checkpoint format (dict {"model_state_dict","state_dim","num_actions",...}):
     kiem tra dung nhu load_training_checkpoint() trong train.py (bao loi neu
     state_dim/num_actions khong khop, giong het dieu kien trong train.py).
-  - ACTIONS, RESOLUTIONS, BITRATE_RATIOS, VCUSimEnv,
+  - ACTIONS, RESOLUTIONS, BITRATE_RATIOS, ROI_QOFFSET_LEVELS, VCUSimEnv,
     _sanitize_action(), _get_obs(), reset(), segment_len, STATE_DIM,
     SEMANTIC_SCORE_MAX, DEFAULT_TRACE_PATH, DEFAULT_YOLO_METADATA_PATH:
     import thang tu env.py, KHONG viet lai logic sanitize/obs.
   - probe_video(): copy cach doc do phan giai/fps/so frame bang ffprobe.
 
 HAI QUYET DINH BAN DA CHON (khong tu suy dien):
-  1) Gop doan ffmpeg vat ly: MOI KHI action (bitrate_ratio HOAC
-     resolution_idx) sau sanitize THUC SU khac frame truoc, dong doan
+  1) Gop doan ffmpeg vat ly: MOI KHI action (bitrate_ratio, resolution_idx
+     HOAC roi_idx) sau sanitize THUC SU khac frame truoc, dong doan
      dang mo va bat dau doan moi. (Khong dung segment_len co dinh lam kich
      thuoc vat ly -- segment_len chi con tac dung dung y nghia goc cua no
-     trong env.py: khoa resolution qua _sanitize_action().)
+     trong env.py: khoa resolution va ROI level qua _sanitize_action().)
   2) Rate control: ABR that (-b:v/-maxrate/-bufsize) theo dung
      target_bitrate = bitrate_ratio * bandwidth (env.py dong 279), KHONG
      dung CRF co dinh. Ban tu xac nhan day la lua chon dung y nghia action.
@@ -45,6 +45,7 @@ CACH DUNG:
       --input dataset/videos/xxx.mp4 \
       --policy dqn_policy.pt \
       --trace outputs/metadata/rl_states.jsonl \
+      --yolo-metadata outputs/metadata/yolo_metadata.jsonl \
       --out outputs/yolov5_results/exported_policy_video.mp4
 """
 
@@ -62,10 +63,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from env import (  # noqa: E402  (thu vien that cua ban, khong viet lai)
     ACTIONS,
+    DEFAULT_YOLO_METADATA_PATH,
     DEFAULT_TRACE_PATH,
     RESOLUTIONS,
+    ROI_QOFFSET_LEVELS,
     VCUSimEnv,
 )
+from encode_grid import load_yolo_metadata, union_roi_for_segment  # noqa: E402
 from train import QNetwork, _torch_load_checkpoint  # noqa: E402
 
 
@@ -198,16 +202,17 @@ def build_decision_stream(env, qnet):
         # xong truoc khi encode) -- giong het env.step() lam sau moi buoc.
         env.prev_bandwidth = bandwidth
         env.current_resolution_idx = safe_action.resolution_idx
+        env.current_roi_idx = safe_action.roi_idx
         # LUU Y: prev_bitrate KHONG duoc cap nhat o day -- no chi duoc cap
         # nhat trong build_and_encode_segments() SAU KHI mot doan duoc encode
         # that va do duoc bitrate that (xem docstring dau file).
     return decisions
 
 
-def build_and_encode_segments(input_path, decisions, orig_w, orig_h, fps,
-                               workdir, env,
+def build_and_encode_segments(input_path, decisions, yolo_by_frame,
+                               orig_w, orig_h, fps, workdir, env,
                                ffmpeg_bin="ffmpeg", ffprobe_bin="ffprobe"):
-    """Gom cac frame lien tiep co CUNG (resolution_idx, bitrate_ratio)
+    """Gom cac frame lien tiep co CUNG (resolution_idx, bitrate_ratio, roi_idx)
     sau sanitize thanh 1 doan ffmpeg vat ly; MOI KHI action
     doi thi dong doan dang mo, encode that, do bitrate that, cap nhat
     env.prev_bitrate (dung cho quyet dinh cua CAC DOAN SAU -- xem docstring
@@ -218,8 +223,15 @@ def build_and_encode_segments(input_path, decisions, orig_w, orig_h, fps,
 
     def close_segment(seg_start, seg_end, action):
         width, height = RESOLUTIONS[action.resolution_idx]
-        roi_box = None
-        qoffset = 0.0
+        qoffset = ROI_QOFFSET_LEVELS[action.roi_idx]
+        roi_box = (
+            union_roi_for_segment(
+                yolo_by_frame, seg_start, seg_end,
+                orig_w, orig_h, width, height,
+            )
+            if abs(qoffset) > 1e-9
+            else None
+        )
 
         # target bitrate = trung binh bitrate_ratio * bandwidth tren toan
         # doan (bitrate_ratio co dinh trong doan, bandwidth co the doi nhe
@@ -246,13 +258,18 @@ def build_and_encode_segments(input_path, decisions, orig_w, orig_h, fps,
             "end_frame": seg_end,
             "resolution": [width, height],
             "bitrate_ratio": action.bitrate_ratio,
+            "roi_idx": action.roi_idx,
+            "roi_qoffset": qoffset,
+            "roi_box": list(roi_box) if roi_box is not None else None,
+            "roi_applied": roi_box is not None and abs(qoffset) > 1e-9,
             "target_bitrate_kbps": round(target_bitrate, 2),
             "measured_bitrate_kbps": round(avg_real_bitrate, 2),
             "path": enc_path,
         })
         print(
             f"[segment] frames [{seg_start},{seg_end}) | {width}x{height} | "
-            f"bitrate_ratio={action.bitrate_ratio} | target={target_bitrate:.0f}kbps "
+            f"bitrate_ratio={action.bitrate_ratio} | roi_idx={action.roi_idx} "
+            f"qoffset={qoffset} | target={target_bitrate:.0f}kbps "
             f"measured={avg_real_bitrate:.0f}kbps",
             file=sys.stderr,
         )
@@ -263,6 +280,7 @@ def build_and_encode_segments(input_path, decisions, orig_w, orig_h, fps,
             changed = (
                 action.resolution_idx != seg_action.resolution_idx
                 or action.bitrate_ratio != seg_action.bitrate_ratio
+                or action.roi_idx != seg_action.roi_idx
             )
         else:
             changed = True  # het trace -> dong doan cuoi cung
@@ -311,12 +329,14 @@ def main():
     ap.add_argument("--policy", required=True, help="dqn_policy.pt")
     ap.add_argument("--trace", default=DEFAULT_TRACE_PATH,
                      help="rl_states.jsonl (mac dinh: env.DEFAULT_TRACE_PATH)")
+    ap.add_argument("--yolo-metadata", default=DEFAULT_YOLO_METADATA_PATH,
+                     help="YOLO JSONL co detections[].bbox de tao ROI box cho tung doan")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-bitrate-kbps", type=float, default=8000.0,
                      help="Phai khop max_bitrate_kbps da dung khi train (mac dinh env.py: 8000.0)")
     ap.add_argument("--segment-len", type=int, default=8,
                      help="Phai khop segment_len da dung khi train (mac dinh env.py: 8) "
-                          "-- dieu khien khi nao resolution duoc phep doi, KHONG phai "
+                          "-- dieu khien khi nao resolution/ROI duoc phep doi, KHONG phai "
                           "kich thuoc doan ffmpeg vat ly (xem docstring dau file)")
     ap.add_argument("--concat-width", type=int, default=1920)
     ap.add_argument("--concat-height", type=int, default=1080)
@@ -354,12 +374,21 @@ def main():
     qnet = load_policy(args.policy, env)
 
     decisions = build_decision_stream(env, qnet)
+    if any(action.roi_idx > 0 for _, action, _, _ in decisions):
+        if not os.path.isfile(args.yolo_metadata):
+            raise FileNotFoundError(
+                "Policy da chon ROI encoding nhung khong tim thay YOLO metadata: "
+                f"{args.yolo_metadata}"
+            )
+        yolo_by_frame = load_yolo_metadata(args.yolo_metadata)
+    else:
+        yolo_by_frame = {}
 
     workdir = args.workdir or tempfile.mkdtemp(prefix="policy_export_")
     os.makedirs(workdir, exist_ok=True)
 
     segments = build_and_encode_segments(
-        args.input, decisions, orig_w, orig_h, fps, workdir, env,
+        args.input, decisions, yolo_by_frame, orig_w, orig_h, fps, workdir, env,
         ffmpeg_bin=args.ffmpeg_bin, ffprobe_bin=args.ffprobe_bin
     )
 
@@ -382,4 +411,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
