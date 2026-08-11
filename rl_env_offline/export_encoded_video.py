@@ -26,7 +26,7 @@ HAI QUYET DINH BAN DA CHON (khong tu suy dien):
      thuoc vat ly -- segment_len chi con tac dung dung y nghia goc cua no
      trong env.py: khoa resolution qua _sanitize_action().)
   2) Rate control: ABR that (-b:v/-maxrate/-bufsize) theo dung
-     target_bitrate = bitrate_ratio * bandwidth (env.py dong 279), KHONG
+     target_bitrate = bitrate_ratio * max_bitrate (env.py), KHONG
      dung CRF co dinh. Ban tu xac nhan day la lua chon dung y nghia action.
 
 DIEM CAN LUU Y VE NHAN QUA (khong the lam khac di, khong phai loi thiet ke):
@@ -221,12 +221,10 @@ def build_and_encode_segments(input_path, decisions, orig_w, orig_h, fps,
         roi_box = None
         qoffset = 0.0
 
-        # target bitrate = trung binh bitrate_ratio * bandwidth tren toan
-        # doan (bitrate_ratio co dinh trong doan, bandwidth co the doi nhe
-        # frame-to-frame -- lay trung binh de co 1 gia tri -b:v duy nhat
-        # cho ca doan, dung dinh nghia target_bitrate trong env.py dong 279).
-        bw_values = [decisions[i][2] for i in range(seg_start, seg_end)]
-        target_bitrate = action.bitrate_ratio * (sum(bw_values) / len(bw_values))
+        # target bitrate dung cung dinh nghia voi env.py: bitrate_ratio la
+        # ti le cua max_bitrate, con bandwidth la bien state/reward de policy
+        # tu hoc tranh vuot kha nang mang.
+        target_bitrate = action.bitrate_ratio * env.max_bitrate
 
         tag = f"s{seg_start}_{seg_end}"
         enc_path = encode_segment_abr(
@@ -382,4 +380,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
