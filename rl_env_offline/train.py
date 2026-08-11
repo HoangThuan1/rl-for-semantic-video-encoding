@@ -160,6 +160,12 @@ def train(
     target_update_every=10,
     seed=7,
 ):
+    if not encode_grid_path:
+        raise ValueError(
+            "Train bat buoc can --encode-grid-path. "
+            "Hay tao grid bang encode_grid.py truoc khi train."
+        )
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -258,7 +264,7 @@ def train(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace-path", default=None)
-    parser.add_argument("--encode-grid-path", default=None)
+    parser.add_argument("--encode-grid-path", required=True)
     parser.add_argument("--output", default="dqn_policy.pt")
     parser.add_argument("--resume", default=None, help="Checkpoint cu de tiep tuc train")
     parser.add_argument("--episodes", type=int, default=300)
@@ -277,4 +283,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

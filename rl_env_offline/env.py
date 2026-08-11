@@ -197,7 +197,7 @@ def load_encode_grid(path):
 
 class VCUSimEnv(gym.Env):
     """
-    Offline surrogate cho VCU encoder.
+    Offline surrogate cho VCU encoder, bat buoc dung encode grid.
 
     State normalized:
       [bandwidth, prev_bitrate, semantic_score]
@@ -287,22 +287,21 @@ class VCUSimEnv(gym.Env):
 
         semantic_score = float(row.get("semantic_score", 0.0))
         bandwidth = float(row.get("bandwidth", self.max_bitrate))
-        motion = float(row.get("motion", self._infer_motion()))
         roi_area = float(row.get("roi_area", self._infer_roi_area(semantic_score)))
 
         safe_action = self._sanitize_action(raw_action, semantic_score, bandwidth)
         width, height = RESOLUTIONS[safe_action.resolution_idx]
         target_bitrate = safe_action.bitrate_ratio * bandwidth
 
-        if self.grid is not None:
-            actual_bitrate, vmaf, latency, power = self._encode_from_grid(
-                safe_action, target_bitrate, row.get("frame_idx", self.t),
-                semantic_score, roi_area, width, height
+        if self.grid is None:
+            raise RuntimeError(
+                "VCUSimEnv yeu cau encode_grid_path de train/evaluate. "
+                "Hay tao grid bang encode_grid.py va truyen --encode-grid-path."
             )
-        else:
-            actual_bitrate, vmaf, latency, power = self._simulate_encode(
-                width, height, safe_action, target_bitrate, semantic_score, motion, roi_area
-            )
+        actual_bitrate, vmaf, latency, power = self._encode_from_grid(
+            safe_action, target_bitrate, row.get("frame_idx", self.t),
+            semantic_score, roi_area, width, height
+        )
 
         reward, reward_terms = self._compute_reward(
             vmaf=vmaf,
@@ -407,30 +406,6 @@ class VCUSimEnv(gym.Env):
         power = 0.5 + 1.2 * (pixels / (1920 * 1080)) ** 0.8 * complexity
         return actual_bitrate, vmaf, latency, power
 
-    def _simulate_encode(self, width, height, action, target_bitrate, semantic_score, motion, roi_area):
-        pixels = width * height
-        res_factor = pixels / (1920 * 1080)
-        semantic_norm = np.clip(semantic_score / SEMANTIC_SCORE_MAX, 0.0, 1.0)
-        roi_strength = action.roi_idx / max(len(ROI_QOFFSET_LEVELS) - 1, 1)
-        complexity = (
-            1.0 + 0.65 * motion + 0.55 * roi_area
-            + 0.25 * semantic_norm + 0.08 * roi_strength
-        )
-
-        demanded_bitrate = self.max_bitrate * res_factor * complexity * 0.42
-        actual_bitrate = float(np.clip(min(demanded_bitrate, target_bitrate), 50.0, self.max_bitrate))
-
-        bitrate_gain = 17.0 * math.log10(max(actual_bitrate, 50.0) / 350.0)
-        resolution_gain = 16.0 * math.log10(max(res_factor, 0.12) / 0.12)
-        roi_relevance = semantic_norm * np.clip(roi_area * 3.0, 0.0, 1.0)
-        roi_quality_gain = 6.0 * roi_strength * roi_relevance
-        vmaf = 58.0 + bitrate_gain + resolution_gain - 9.0 * motion + roi_quality_gain
-        vmaf = float(np.clip(vmaf, 0.0, 100.0))
-
-        latency = 5.0 + 25.0 * res_factor * complexity
-        power = 0.55 + 1.15 * (res_factor ** 0.8) * complexity
-        return actual_bitrate, vmaf, latency, power
-
     @staticmethod
     def _cell_vmaf(cell):
         if "vmaf" in cell:
@@ -527,9 +502,6 @@ class VCUSimEnv(gym.Env):
             "qoe_reward_term": float(self.qoe_weight * qoe_norm),
             "bitrate_penalty_term": float(self.bitrate_cost_weight * bitrate_cost),
         }
-
-    def _infer_motion(self):
-        return 0.25 + 0.25 * math.sin(self.t / 13.0)
 
     @staticmethod
     def _infer_roi_area(semantic_score):

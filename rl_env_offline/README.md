@@ -71,8 +71,7 @@ là phản hồi sau action và được dùng để tính reward.
 
 Vì vậy encode grid không cung cấp trực tiếp ba phần tử của state. Vai trò của
 nó là cung cấp đường rate-distortion để môi trường xác định VMAF sau khi agent
-chọn action. Không truyền `--encode-grid-path` vẫn train được, nhưng reward khi
-đó dựa trên `_simulate_encode()` thay vì số đo encode offline.
+chọn action. `--encode-grid-path` là bắt buộc khi train/evaluate.
 
 Trong code:
 
@@ -135,7 +134,7 @@ s_t, a_t -> encoder surrogate -> r_t, s_{t+1}
 Môi trường tăng `t` sang frame kế tiếp. Khi hết trace, episode kết thúc nếu
 `loop=False`.
 
-Nếu có `encode_grid_path`, môi trường dùng đường rate-distortion đo offline
+Môi trường bắt buộc dùng `encode_grid_path` và tra đường rate-distortion đo offline
 của đúng frame và resolution:
 
 ```text
@@ -165,9 +164,7 @@ Nhờ vậy ROI encoding chỉ có lợi khi chất lượng vùng semantic th�
 thay vì thưởng cố định chỉ vì agent chọn `roi_idx > 0`.
 
 Vì vậy các frame/segment ít chuyển động và nhiều chuyển động có thể có đường
-RD khác nhau dù cùng bitrate. Nếu không có grid, môi trường dùng hàm mô phỏng
-`_simulate_encode()` dựa trên bitrate, độ phân giải, motion, ROI area và
-semantic score.
+RD khác nhau dù cùng bitrate.
 
 ### Đồng bộ RL trace với encode grid
 
@@ -370,9 +367,8 @@ python3 evaluate.py \
   --policy dqn_policy.pt
 ```
 
-Có thể bỏ `--encode-grid-path` để smoke test bằng `_simulate_encode()`. Chế độ
-này có mô hình xấp xỉ ROI quality gain, nhưng nên dùng encode grid có VMAF khi
-train kết quả chính thức.
+`--encode-grid-path` là bắt buộc khi train vì reward chỉ lấy từ lookup encode
+grid theo frame/action.
 
 Xuất video thật theo policy:
 

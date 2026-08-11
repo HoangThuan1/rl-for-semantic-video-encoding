@@ -200,7 +200,7 @@ def main():
     ap.add_argument("--policy", required=True)
     ap.add_argument("--rewards", default=None,
                      help="Mac dinh: tu doan <policy khong duoi>.rewards.json")
-    ap.add_argument("--encode-grid", default=None)
+    ap.add_argument("--encode-grid", required=True)
     ap.add_argument("--plot-out", default="eval_convergence.png")
     ap.add_argument("--random-runs", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
