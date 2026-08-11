@@ -1,11 +1,10 @@
 """
 NOTE THIET KE:
 Env nay dung state gon cho Semantic-aware Bitrate Control:
-  [bandwidth, prev_vmaf, semantic_score, prev_bitrate, current_resolution].
-Reward khong cong semantic_score truc tiep; semantic_score chi lam tang trong
-so cua ROI quality, roi tru bitrate/over-bandwidth/switch penalty.
+  [bandwidth, prev_bitrate, semantic_score].
+Reward theo cong thuc R = 0.6 * QoE_norm - 0.4 * bitrate_cost.
 Action duoc roi rac hoa de hop voi DQN va duoc "sanitize" truoc khi dua vao
-surrogate VCU, tranh doi resolution giua segment/GOP.
+surrogate VCU, tranh de policy xung dot voi rate control cap thap cua encoder.
 Resolution duoc xem la quyet dinh cap segment/GOP, khong phai thay tung frame.
 """
 
@@ -21,7 +20,7 @@ import numpy as np
 from gymnasium import spaces
 
 RESOLUTIONS = [(640, 480), (1280, 720), (1920, 1080)]
-BITRATE_RATIOS = [0.10, 0.25, 0.50, 0.75, 0.95]
+BITRATE_RATIOS = [0.50, 0.75, 0.95]
 RESOLUTION_ACTIONS = [0, 1, 2]
 
 SEMANTIC_SCORE_MAX = 30.0
@@ -29,11 +28,7 @@ MOTION_MAX = 1.0
 ROI_AREA_MAX = 1.0
 LATENCY_BUDGET_MS = 40.0
 DEFAULT_QOE_WEIGHT = 0.60
-DEFAULT_BITRATE_COST_WEIGHT = 0.18
-DEFAULT_OVER_BW_WEIGHT = 1.25
-DEFAULT_SWITCH_WEIGHT = 0.08
-DEFAULT_GLOBAL_QUALITY_WEIGHT = 0.65
-DEFAULT_ROI_QUALITY_WEIGHT = 0.35
+DEFAULT_BITRATE_COST_WEIGHT = 0.40
 DEFAULT_METADATA_DIR = "outputs/metadata"
 DEFAULT_TRACE_PATH = "outputs/metadata/rl_states.jsonl"
 DEFAULT_YOLO_METADATA_PATH = "outputs/metadata/yolo_metadata.jsonl"
@@ -201,16 +196,15 @@ class VCUSimEnv(gym.Env):
     Offline surrogate cho VCU encoder.
 
     State normalized:
-      [bandwidth, previous_vmaf, semantic_score, previous_bitrate,
-       current_resolution]
+      [bandwidth, prev_bitrate, semantic_score]
 
     Action:
-      index roi rac trong ACTIONS = target bitrate ratio x resolution.
+      index roi rac trong ACTIONS = bitrate target ratio x resolution.
     """
 
     metadata = {"render_modes": []}
     NUM_ACTIONS = len(ACTIONS)
-    STATE_DIM = 5
+    STATE_DIM = 3
 
     def __init__(
         self,
@@ -224,10 +218,6 @@ class VCUSimEnv(gym.Env):
         segment_len=8,
         qoe_weight=DEFAULT_QOE_WEIGHT,
         bitrate_cost_weight=DEFAULT_BITRATE_COST_WEIGHT,
-        over_bw_weight=DEFAULT_OVER_BW_WEIGHT,
-        switch_weight=DEFAULT_SWITCH_WEIGHT,
-        global_quality_weight=DEFAULT_GLOBAL_QUALITY_WEIGHT,
-        roi_quality_weight=DEFAULT_ROI_QUALITY_WEIGHT,
     ):
         super().__init__()
         resolved_trace_path = trace_path
@@ -249,10 +239,6 @@ class VCUSimEnv(gym.Env):
         self.segment_len = max(1, int(segment_len))
         self.qoe_weight = float(qoe_weight)
         self.bitrate_cost_weight = float(bitrate_cost_weight)
-        self.over_bw_weight = float(over_bw_weight)
-        self.switch_weight = float(switch_weight)
-        self.global_quality_weight = float(global_quality_weight)
-        self.roi_quality_weight = float(roi_quality_weight)
 
         self.grid = load_encode_grid(encode_grid_path) if encode_grid_path else None
         self.grid_qp_levels = self.grid.get("qp_levels") if self.grid else None
@@ -291,25 +277,20 @@ class VCUSimEnv(gym.Env):
 
         safe_action = self._sanitize_action(raw_action, semantic_score, bandwidth)
         width, height = RESOLUTIONS[safe_action.resolution_idx]
-        target_bitrate = safe_action.bitrate_ratio * self.max_bitrate
+        target_bitrate = safe_action.bitrate_ratio * bandwidth
 
         if self.grid is not None:
-            actual_bitrate, vmaf, roi_vmaf, latency, power = self._encode_from_grid(
-                safe_action, target_bitrate, row.get("frame_idx", self.t),
-                semantic_score, width, height, motion, roi_area
+            actual_bitrate, vmaf, latency, power = self._encode_from_grid(
+                safe_action, target_bitrate, row.get("frame_idx", self.t), semantic_score, width, height
             )
         else:
-            actual_bitrate, vmaf, roi_vmaf, latency, power = self._simulate_encode(
+            actual_bitrate, vmaf, latency, power = self._simulate_encode(
                 width, height, safe_action, target_bitrate, semantic_score, motion, roi_area
             )
 
         reward, reward_terms = self._compute_reward(
             vmaf=vmaf,
-            roi_vmaf=roi_vmaf,
             actual_bitrate=actual_bitrate,
-            bandwidth=bandwidth,
-            semantic_score=semantic_score,
-            action=safe_action,
         )
 
         self.prev_bandwidth = bandwidth
@@ -335,7 +316,6 @@ class VCUSimEnv(gym.Env):
             "actual_bitrate": actual_bitrate,
             "target_bitrate": target_bitrate,
             "vmaf": vmaf,
-            "roi_vmaf": roi_vmaf,
             "latency": latency,
             "power": power,
             "resolution": (width, height),
@@ -354,18 +334,22 @@ class VCUSimEnv(gym.Env):
         row = self.trace[self.t]
         bandwidth = float(row.get("bandwidth", self.max_bitrate))
         bandwidth_norm = np.clip(bandwidth / self.max_bitrate, 0.0, 1.0)
-        vmaf_norm = np.clip(self.prev_vmaf / 100.0, 0.0, 1.0)
-        semantic_norm = np.clip(float(row.get("semantic_score", 0.0)) / SEMANTIC_SCORE_MAX, 0.0, 1.0)
         bitrate_norm = np.clip(self.prev_bitrate / self.max_bitrate, 0.0, 1.0)
-        resolution_norm = self.current_resolution_idx / max(len(RESOLUTIONS) - 1, 1)
-        return np.array(
-            [bandwidth_norm, vmaf_norm, semantic_norm, bitrate_norm, resolution_norm],
-            dtype=np.float32,
-        )
+        semantic_norm = np.clip(float(row.get("semantic_score", 0.0)) / SEMANTIC_SCORE_MAX, 0.0, 1.0)
+        return np.array([bandwidth_norm, bitrate_norm, semantic_norm], dtype=np.float32)
 
     def _sanitize_action(self, action, semantic_score, bandwidth):
-        bitrate_ratio = float(np.clip(action.bitrate_ratio, min(BITRATE_RATIOS), max(BITRATE_RATIOS)))
+        bitrate_ratio = min(action.bitrate_ratio, 0.95)
         resolution_idx = action.resolution_idx
+
+        if bandwidth < 300.0:
+            resolution_idx = min(resolution_idx, 1)
+            bitrate_ratio = min(bitrate_ratio, 0.75)
+        elif bandwidth < 900.0:
+            resolution_idx = min(resolution_idx, 1)
+
+        if semantic_score > 0.85 * SEMANTIC_SCORE_MAX and bandwidth > 2500.0:
+            resolution_idx = max(resolution_idx, 1)
 
         # Model resolution as a segment/GOP-level decision to avoid rapid reconfigure.
         if self.t % self.segment_len != 0:
@@ -373,7 +357,7 @@ class VCUSimEnv(gym.Env):
 
         return EncoderAction(bitrate_ratio, resolution_idx)
 
-    def _encode_from_grid(self, action, target_bitrate, frame_idx, semantic_score, width, height, motion, roi_area):
+    def _encode_from_grid(self, action, target_bitrate, frame_idx, semantic_score, width, height):
         qp_idx = 0
         key = f"res{action.resolution_idx}_qp{qp_idx}"
         frames = self.grid["grid"][key]
@@ -387,8 +371,7 @@ class VCUSimEnv(gym.Env):
         complexity = 1.0 + 0.08 * min(semantic_score, SEMANTIC_SCORE_MAX)
         latency = 5.0 + (pixels / (1920 * 1080)) * 25.0 * complexity
         power = 0.5 + 1.2 * (pixels / (1920 * 1080)) ** 0.8 * complexity
-        roi_vmaf = self._estimate_roi_vmaf(vmaf, actual_bitrate, target_bitrate, motion, roi_area)
-        return actual_bitrate, vmaf, roi_vmaf, latency, power
+        return actual_bitrate, vmaf, latency, power
 
     def _simulate_encode(self, width, height, action, target_bitrate, semantic_score, motion, roi_area):
         pixels = width * height
@@ -403,11 +386,10 @@ class VCUSimEnv(gym.Env):
         resolution_gain = 16.0 * math.log10(max(res_factor, 0.12) / 0.12)
         vmaf = 58.0 + bitrate_gain + resolution_gain - 9.0 * motion
         vmaf = float(np.clip(vmaf, 0.0, 100.0))
-        roi_vmaf = self._estimate_roi_vmaf(vmaf, actual_bitrate, target_bitrate, motion, roi_area)
 
         latency = 5.0 + 25.0 * res_factor * complexity
         power = 0.55 + 1.15 * (res_factor ** 0.8) * complexity
-        return actual_bitrate, vmaf, roi_vmaf, latency, power
+        return actual_bitrate, vmaf, latency, power
 
     @staticmethod
     def _cell_vmaf(cell):
@@ -415,46 +397,17 @@ class VCUSimEnv(gym.Env):
             return float(cell["vmaf"])
         raise KeyError("Encode grid thieu field 'vmaf'. Hay chay lai encode_grid.py de tao grid VMAF.")
 
-    @staticmethod
-    def _estimate_roi_vmaf(vmaf, actual_bitrate, target_bitrate, motion, roi_area):
-        rate_pressure = np.clip(1.0 - actual_bitrate / max(target_bitrate, 50.0), 0.0, 1.0)
-        roi_drop = 10.0 * roi_area + 7.0 * motion + 8.0 * rate_pressure
-        roi_bonus = 4.0 * np.clip(actual_bitrate / max(target_bitrate, 50.0), 0.0, 1.0)
-        return float(np.clip(vmaf - roi_drop + roi_bonus, 0.0, 100.0))
-
-    def _compute_reward(self, vmaf, roi_vmaf, actual_bitrate, bandwidth, semantic_score, action):
-        global_q = np.clip(vmaf / 100.0, 0.0, 1.0)
-        roi_q = np.clip(roi_vmaf / 100.0, 0.0, 1.0)
-        semantic_norm = np.clip(semantic_score / SEMANTIC_SCORE_MAX, 0.0, 1.0)
-        roi_weight = self.roi_quality_weight * semantic_norm
-        semantic_quality = self.global_quality_weight * global_q + roi_weight * roi_q
-
+    def _compute_reward(self, vmaf, actual_bitrate):
+        qoe_norm = np.clip(vmaf / 100.0, 0.0, 1.0)
         bitrate_cost = actual_bitrate / self.max_bitrate
-        over_bw = max(0.0, (actual_bitrate - bandwidth) / max(bandwidth, 1.0))
-        bitrate_switch = abs(actual_bitrate - self.prev_bitrate) / self.max_bitrate
-        resolution_switch = 1.0 if action.resolution_idx != self.current_resolution_idx else 0.0
-        switch_cost = bitrate_switch + resolution_switch
-
-        reward = (
-            self.qoe_weight * semantic_quality
-            - self.bitrate_cost_weight * bitrate_cost
-            - self.over_bw_weight * over_bw
-            - self.switch_weight * switch_cost
-        )
+        reward = self.qoe_weight * qoe_norm - self.bitrate_cost_weight * bitrate_cost
 
         return float(reward), {
-            "qoe_norm": float(semantic_quality),
-            "vmaf_norm": float(global_q),
-            "roi_vmaf_norm": float(roi_q),
-            "semantic_quality": float(semantic_quality),
-            "semantic_roi_weight": float(roi_weight),
+            "qoe_norm": float(qoe_norm),
+            "vmaf_norm": float(qoe_norm),
             "bitrate_cost": float(bitrate_cost),
-            "over_bandwidth_penalty": float(over_bw),
-            "switch_cost": float(switch_cost),
-            "qoe_reward_term": float(self.qoe_weight * semantic_quality),
+            "qoe_reward_term": float(self.qoe_weight * qoe_norm),
             "bitrate_penalty_term": float(self.bitrate_cost_weight * bitrate_cost),
-            "over_bandwidth_penalty_term": float(self.over_bw_weight * over_bw),
-            "switch_penalty_term": float(self.switch_weight * switch_cost),
         }
 
     def _infer_motion(self):

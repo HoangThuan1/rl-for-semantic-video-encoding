@@ -3,8 +3,8 @@ NOTE THIET KE:
     Training nay dung DQN roi rac hoa action cho Semantic-aware Adaptive Encoding.
 Moi action la mot to hop {target bitrate ratio, resolution level}.
 Env se sanitize action truoc khi mo phong VCU de giam xung dot voi hardware
-rate control. Reward khong dung semantic_score truc tiep; semantic_score lam
-tang gia tri cua ROI quality, roi tru penalty bitrate, vuot bandwidth va switch.
+rate control. Reward khong dung semantic_score truc tiep, ma dung VMAF
+normalized cong voi penalty bitrate.
 """
 
 import argparse
@@ -277,3 +277,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

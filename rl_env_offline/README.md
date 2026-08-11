@@ -41,32 +41,26 @@ Double DQN policy
 
 ### State
 
-State trong `env.py` là vector 5 chiều đã chuẩn hóa về `[0, 1]`:
+State trong `env.py` là vector 3 chiều đã chuẩn hóa về `[0, 1]`:
 
 ```text
 s_t = [
   bandwidth_t / max_bitrate,
-  previous_vmaf_t / 100,
-  semantic_score_t / SEMANTIC_SCORE_MAX,
-  previous_bitrate_t / max_bitrate,
-  current_resolution_idx / (num_resolutions - 1)
+  prev_bitrate_t / max_bitrate,
+  semantic_score_t / SEMANTIC_SCORE_MAX
 ]
 ```
 
 Ý nghĩa:
 
 - `bandwidth_t`: điều kiện mạng tại thời điểm hiện tại.
-- `previous_vmaf_t`: chất lượng đã quan sát được ở bước trước, đóng vai trò
-  thành phần `Q` trong đề xuất `[B, Q, S]`.
+- `prev_bitrate_t`: bitrate thực tế của bước trước, giúp agent nhận biết quán
+  tính lựa chọn mã hóa.
 - `semantic_score_t`: mức độ quan trọng của nội dung hình ảnh.
-- `previous_bitrate_t`: bitrate thực tế của bước trước, giúp agent nhận biết
-  quán tính lựa chọn mã hóa.
-- `current_resolution_idx`: độ phân giải hiện tại, để policy học chi phí đổi
-  cấu hình tuần tự.
 
 Trong code:
 
-- `STATE_DIM = 5`
+- `STATE_DIM = 3`
 - `SEMANTIC_SCORE_MAX = 30.0`
 - `max_bitrate_kbps` mặc định là `8000.0`
 
@@ -80,7 +74,7 @@ a_t = (bitrate_ratio, resolution_idx)
 
 Trong đó:
 
-- `bitrate_ratio` thuộc `{0.10, 0.25, 0.50, 0.75, 0.95}`
+- `bitrate_ratio` thuộc `{0.50, 0.75, 0.95}`
 - `resolution_idx` thuộc `{0, 1, 2}`
 - `resolution_idx = 0`: `640x480`
 - `resolution_idx = 1`: `1280x720`
@@ -89,22 +83,21 @@ Trong đó:
 Tổng số action:
 
 ```text
-|A| = 5 x 3 = 15
+|A| = 3 x 3 = 9
 ```
 
 Bitrate mục tiêu được tính theo:
 
 ```text
-target_bitrate_t = bitrate_ratio x max_bitrate
+target_bitrate_t = bitrate_ratio x bandwidth_t
 ```
 
-Như vậy `bandwidth_t` không còn tự động nhân vào action. Agent phải tự học:
-khi `bandwidth_t` thấp thì chọn target bitrate thấp hơn hoặc resolution thấp
-hơn; khi bandwidth cao mới dùng các action chất lượng cao hơn.
+Trước khi đưa vào mô phỏng encoder, action được "sanitize" trong
+`_sanitize_action()` để tránh lựa chọn không thực tế:
 
-Trước khi đưa vào mô phỏng encoder, action chỉ được "sanitize" để giữ quyết
-định resolution ở cấp segment/GOP, không đổi liên tục từng frame. Các quan hệ
-network/semantic/rate-quality được học qua reward thay vì hard-code bằng luật.
+- Nếu băng thông quá thấp, giới hạn độ phân giải và bitrate ratio.
+- Nếu semantic score cao và mạng đủ tốt, không hạ xuống độ phân giải quá thấp.
+- Độ phân giải chỉ đổi theo cấp segment/GOP, không đổi liên tục từng frame.
 
 ### Transition
 
@@ -124,40 +117,26 @@ phân giải, motion, ROI area và semantic score.
 
 ### Reward
 
-Reward không cộng trực tiếp `semantic_score`, vì `S` là thuộc tính nội dung chứ
-không phải thành quả do agent tạo ra. Thay vào đó, `S` làm tăng trọng số của
-ROI quality:
+Reward hiện tại ưu tiên chất lượng VMAF và phạt bitrate:
 
 ```text
-Q_semantic =
-  w_global x VMAF_norm
-  + w_roi x semantic_norm x ROI_VMAF_norm
-
-r_t =
-  w_q x Q_semantic
-  - w_b x actual_bitrate_t / max_bitrate
-  - w_o x max(0, (actual_bitrate_t - bandwidth_t) / bandwidth_t)
-  - w_s x switch_cost_t
+r_t = vmaf_weight x (VMAF_t / 100) - (actual_bitrate_t / max_bitrate)
 ```
 
 Trong code:
 
 ```python
-global_q = clip(vmaf / 100.0, 0.0, 1.0)
-roi_q = clip(roi_vmaf / 100.0, 0.0, 1.0)
-semantic_quality = w_global * global_q + w_roi * semantic_norm * roi_q
+vmaf_norm = clip(vmaf / 100.0, 0.0, 1.0)
 bitrate_cost = actual_bitrate / max_bitrate
-over_bw = max(0, (actual_bitrate - bandwidth) / bandwidth)
-reward = w_q * semantic_quality - w_b * bitrate_cost - w_o * over_bw - w_s * switch_cost
+reward = vmaf_weight * vmaf_norm - bitrate_cost
 ```
 
 Ý nghĩa:
 
-- Agent được thưởng khi VMAF/ROI VMAF cao.
-- Cảnh semantic cao làm ROI quality đáng giá hơn, nhưng không tự sinh reward.
+- Agent được thưởng khi VMAF cao.
 - Agent bị phạt nếu dùng bitrate lớn.
-- Agent bị phạt mạnh nếu bitrate thực tế vượt bandwidth.
-- Agent bị phạt nếu đổi bitrate quá mạnh hoặc đổi resolution quá thường xuyên.
+- `semantic_score` không cộng trực tiếp vào reward; nó ảnh hưởng gián tiếp qua
+  state, action sanitation và mô phỏng độ phức tạp/chất lượng.
 
 Các đại lượng `latency` và `power` hiện được trả về trong `info` để đánh giá,
 nhưng chưa đưa trực tiếp vào reward. Nếu muốn mở rộng, có thể thêm penalty:
@@ -199,7 +178,7 @@ Script liên quan:
 
 `train.py` dùng Double DQN:
 
-- Mạng Q nhận state 5 chiều và xuất Q-value cho 15 action.
+- Mạng Q nhận state 3 chiều và xuất Q-value cho 9 action.
 - Agent chọn action bằng epsilon-greedy.
 - Replay buffer lưu `(state, action, reward, next_state, done)`.
 - Target network được cập nhật định kỳ.
@@ -260,20 +239,6 @@ python3 evaluate.py --policy dqn_policy.pt
 
 - Random policy.
 - CBR cố định ở action gần `bitrate_ratio=0.75`, `resolution=720p`.
-
-Ngoài bảng baseline, `evaluate.py` còn in các kiểm tra counterfactual để chứng
-minh policy đã học đúng 4 quan hệ:
-
-- `Network -> cấu hình`: giữ semantic và history cố định, thay bandwidth
-  `{600, 1500, 3500, 6500}` kbps, rồi quan sát target bitrate/resolution mà
-  policy chọn.
-- `Semantic -> phân bổ tài nguyên`: giữ bandwidth cố định, thay semantic thấp
-  và cao theo percentile của trace, rồi kiểm tra bitrate/resolution có tăng cho
-  cảnh quan trọng hay không.
-- `Rate-quality`: bảng đánh giá in `VMAF TB` và `ROI VMAF` để xem mức bitrate
-  policy chọn có tạo chất lượng tốt hơn baseline không.
-- `Quyết định tuần tự`: bảng đánh giá in `Vuot BW` và `Doi res`; policy tốt
-  phải giảm vượt bandwidth và không đổi resolution liên tục.
 
 ## 7. Chạy với dữ liệu thật/offline
 
@@ -342,7 +307,7 @@ python3 evaluate.py \
 Các hướng mở rộng tự nhiên cho bài toán:
 
 - Đưa `latency` và `power` vào reward để thành bài toán multi-objective.
-- Thêm state như `prev_latency`, buffer occupancy hoặc packet loss.
+- Thêm state như `prev_vmaf`, `prev_latency`, buffer occupancy hoặc packet loss.
 - Mở rộng action sang QP/ROI strength nếu muốn điều khiển ROI encoding trực tiếp.
 - Dùng trace mạng thật thay vì synthetic bandwidth.
 - Dùng encode grid đo từ pipeline VCU thật để giảm sai lệch giữa simulation và
