@@ -19,26 +19,14 @@ import/tai su dung TRUC TIEP tu code hien co cua ban, khong doan:
     import thang tu env.py, KHONG viet lai logic sanitize/obs.
   - probe_video(): copy cach doc do phan giai/fps/so frame bang ffprobe.
 
-HAI QUYET DINH BAN DA CHON (khong tu suy dien):
-  1) Gop doan ffmpeg vat ly: MOI KHI action (bitrate_ratio, resolution_idx
-     HOAC roi_idx) sau sanitize THUC SU khac frame truoc, dong doan
-     dang mo va bat dau doan moi. (Khong dung segment_len co dinh lam kich
-     thuoc vat ly -- segment_len chi con tac dung dung y nghia goc cua no
-     trong env.py: khoa resolution va ROI level qua _sanitize_action().)
-  2) Rate control: ABR that (-b:v/-maxrate/-bufsize) theo dung
-     target_bitrate = bitrate_ratio * bandwidth (env.py dong 279), KHONG
-     dung CRF co dinh. Ban tu xac nhan day la lua chon dung y nghia action.
+Exporter encode theo GOP co dinh ``segment_len``. Trong tung GOP, target la
+trung binh cua ``bitrate_ratio[t] * bandwidth[t]``; sau khi encode xong, bitrate
+do that duoc feedback vao observation cua GOP tiep theo. Resolution va ROI duoc
+khoa trong GOP dung theo ``_sanitize_action()``.
 
-DIEM CAN LUU Y VE NHAN QUA (khong the lam khac di, khong phai loi thiet ke):
-  prev_bitrate dung lam input cho quyet dinh cua CAC FRAME SAU chi co the la
-  bitrate THAT DA DO DUOC tu doan vua dong (khong the biet bitrate that cua
-  1 doan TRUOC KHI encode xong doan do). Vi vay trong luc 1 doan dang mo,
-  prev_bitrate duoc GIU NGUYEN bang gia tri that cua doan truoc do (giong
-  y het 1 vong feedback control that: hanh dong dua tren ket qua da do
-  duoc gan nhat, khong phai ket qua cua chinh no). prev_bandwidth thi
-  KHONG co do tre nay vi no la dieu kien mang do duoc real-time, khong phu
-  thuoc ket qua encode -- duoc cap nhat tung frame truc tiep tu trace,
-  giong het env.step().
+Muc ROI cua policy (0/-0.3/-0.6) duoc anh xa mac dinh sang qoffset libx264 an
+toan hon (0/-0.05/-0.10). Day la chu y: -0.3/-0.6 qua manh voi VBV bitrate
+thap va co the tao frame xam. Report ghi ca muc policy va muc da ap dung.
 
 CACH DUNG:
   python3 export_encoded_video.py \
@@ -69,8 +57,22 @@ from env import (  # noqa: E402  (thu vien that cua ban, khong viet lai)
     ROI_QOFFSET_LEVELS,
     VCUSimEnv,
 )
-from encode_grid import load_yolo_metadata, union_roi_for_segment  # noqa: E402
 from train import QNetwork, _torch_load_checkpoint  # noqa: E402
+
+
+# qoffset -0.3/-0.6 trong action space duoc dung de phan biet muc ROI khi
+# training. Dua truc tiep cac gia tri do vao libx264 + VBV bitrate thap co the
+# lam rate-control sap (da quan sat frame xam voi -0.6). Exporter anh xa muc
+# action sang cac offset bao thu hon, gan voi vi du -0.1 cua FFmpeg.
+DEFAULT_EXPORT_ROI_QOFFSETS = [0.0, -0.05, -0.10]
+IMPORTANT_CLASSES = {
+    "person": 1.0,
+    "car": 0.9,
+    "truck": 0.9,
+    "bus": 0.9,
+    "motorcycle": 0.8,
+    "bicycle": 0.7,
+}
 
 
 def probe_video(path, ffprobe_bin="ffprobe"):
@@ -117,6 +119,85 @@ def extract_bitrate_per_frame(encoded_path, fps, ffprobe_bin="ffprobe"):
     return [size * 8 * fps / 1000.0 for size in sizes]
 
 
+def load_export_yolo_metadata(path):
+    """Giu detection day du de exporter co the loc confidence/class.
+
+    Loader trong encode_grid chi giu bbox, phu hop viec tao grid nhung khong
+    du thong tin de tranh union ROI tu false-positive trong export that.
+    """
+    out = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            out[int(row["frame_idx"])] = row
+    return out
+
+
+def _even(value):
+    return max(2, int(round(value)) // 2 * 2)
+
+
+def fit_resolution(target_w, target_h, src_w, src_h):
+    """Fit source vao action resolution ma khong keo meo aspect ratio."""
+    scale = min(target_w / src_w, target_h / src_h)
+    return _even(src_w * scale), _even(src_h * scale)
+
+
+def select_roi_boxes(yolo_by_frame, start_frame, end_frame, src_w, src_h,
+                     target_w, target_h, min_confidence=0.40, max_rois=3,
+                     max_total_fraction=0.35, padding_fraction=0.08):
+    """Lay toi da vai ROI tinh tu frame giua GOP thay vi union ca GOP.
+
+    Union moi bbox cua moi frame de lam ROI phong thanh gan toan man hinh.
+    Frame giua la xap xi on dinh cho GOP ngan; confidence va class priority
+    giup loai bot false-positive/vat the khong quan trong.
+    """
+    mid = start_frame + max(0, end_frame - start_frame - 1) // 2
+    row = yolo_by_frame.get(mid)
+    if not row:
+        return []
+
+    candidates = []
+    for det in row.get("detections", []):
+        confidence = float(det.get("confidence", 0.0))
+        if confidence < min_confidence:
+            continue
+        x1, y1, x2, y2 = map(float, det.get("bbox", (0, 0, 0, 0)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        area_fraction = ((x2 - x1) * (y2 - y1)) / max(src_w * src_h, 1)
+        priority = IMPORTANT_CLASSES.get(det.get("class_name", ""), 0.25)
+        candidates.append((priority * confidence * (1.0 + area_fraction), x1, y1, x2, y2))
+
+    sx, sy = target_w / src_w, target_h / src_h
+    selected = []
+    used_fraction = 0.0
+    for _, x1, y1, x2, y2 in sorted(candidates, reverse=True):
+        pad_x = (x2 - x1) * padding_fraction
+        pad_y = (y2 - y1) * padding_fraction
+        x1 = max(0.0, x1 - pad_x)
+        y1 = max(0.0, y1 - pad_y)
+        x2 = min(float(src_w), x2 + pad_x)
+        y2 = min(float(src_h), y2 + pad_y)
+        area_fraction = ((x2 - x1) * (y2 - y1)) / max(src_w * src_h, 1)
+        if area_fraction > max_total_fraction or used_fraction + area_fraction > max_total_fraction:
+            continue
+
+        tx1, ty1 = int(round(x1 * sx)), int(round(y1 * sy))
+        tx2, ty2 = int(round(x2 * sx)), int(round(y2 * sy))
+        tx1 = max(0, min(tx1, target_w - 2))
+        ty1 = max(0, min(ty1, target_h - 2))
+        tx2 = max(tx1 + 2, min(tx2, target_w))
+        ty2 = max(ty1 + 2, min(ty2, target_h))
+        selected.append((tx1, ty1, tx2 - tx1, ty2 - ty1))
+        used_fraction += area_fraction
+        if len(selected) >= max_rois:
+            break
+    return selected
+
+
 # ---------------------------------------------------------------------------
 # Encode 1 doan THAT bang che do ABR (-b:v/-maxrate/-bufsize) theo dung
 # target_bitrate cua policy, thay vi -crf co dinh nhu encode_grid.py
@@ -124,29 +205,37 @@ def extract_bitrate_per_frame(encoded_path, fps, ffprobe_bin="ffprobe"):
 # CRF la lua chon dung cho export that -- ban da tu xac nhan dung ABR).
 # ---------------------------------------------------------------------------
 def encode_segment_abr(input_path, start_frame, end_frame, width, height,
-                        roi_box, qoffset, target_bitrate_kbps, fps, workdir, tag,
+                        roi_boxes, qoffset, target_bitrate_kbps, fps, workdir, tag,
                         ffmpeg_bin="ffmpeg"):
     out_path = os.path.join(workdir, f"seg_{tag}_{start_frame}_{end_frame}.mp4")
-    select_expr = f"between(n\\,{start_frame}\\,{end_frame - 1})"
-    vf = f"select='{select_expr}',setpts=N/FRAME_RATE/TB,scale={width}:{height}:flags=bicubic"
-    if roi_box is not None and abs(qoffset) > 1e-9:
-        x, y, w, h = roi_box
-        vf += f",addroi=x={x}:y={y}:w={w}:h={h}:qoffset={qoffset}"
+    frame_count = end_frame - start_frame
+    vf = (
+        f"trim=start_frame={start_frame}:end_frame={end_frame},"
+        f"setpts=PTS-STARTPTS,scale={width}:{height}:flags=bicubic"
+    )
+    if abs(qoffset) > 1e-9:
+        for x, y, w, h in roi_boxes:
+            vf += f",addroi=x={x}:y={y}:w={w}:h={h}:qoffset={qoffset}"
 
     b_v = max(50.0, target_bitrate_kbps)
     maxrate = b_v * 1.2
     bufsize = b_v * 2.0
-    gop = max(1, end_frame - start_frame)
+    gop = max(1, frame_count)
 
     cmd = [
         ffmpeg_bin, "-y", "-i", input_path,
         "-vf", vf,
+        "-an", "-frames:v", str(frame_count),
         "-c:v", "libx264",
         "-b:v", f"{b_v:.0f}k",
         "-maxrate", f"{maxrate:.0f}k",
         "-bufsize", f"{bufsize:.0f}k",
-        "-bf", "0", "-g", str(gop),
-        "-r", f"{fps:.6f}", "-vsync", "cfr", "-pix_fmt", "yuv420p",
+        # libx264 ROI side-data voi B-frame co the tao frame xam/skip. Tat
+        # B-frame de ROI quant_offsets duoc ap dung on dinh.
+        "-bf", "0", "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
+        # CFR tao timestamp hop le cho MP4. passthrough o day tao packet rong
+        # va decoder hien mau xam voi source nay.
+        "-r", f"{fps:.6f}", "-fps_mode", "cfr", "-pix_fmt", "yuv420p",
         "-loglevel", "error", out_path,
     ]
     run(cmd)
@@ -178,124 +267,92 @@ def greedy_action(qnet, obs):
         return int(torch.argmax(q, dim=1).item())
 
 
-def build_decision_stream(env, qnet):
-    """Chay qua toan bo trace, MOI FRAME hoi policy 1 lan (giong het vong lap
-    trong train.py), qua _sanitize_action() cua env.py de lay action da
-    sanitize. Tra ve list [(frame_idx, safe_action, bandwidth, semantic_score)].
-    Day CHUA phai buoc encode -- chi la buoc quyet dinh, tach rieng de sau do
-    gom doan theo "action thuc su doi" ma khong lam roi logic nhan-qua khi
-    encode (xem build_and_encode_segments)."""
-    decisions = []
-    for t in range(env.n):
-        row = env.trace[t]
-        env.t = t  # dong bo dung frame hien tai cho _sanitize_action()/_get_obs()
-        obs = env._get_obs()
-        action_idx = greedy_action(qnet, obs)
-        raw_action = ACTIONS[action_idx]
-        semantic_score = float(row.get("semantic_score", 0.0))
-        bandwidth = float(row.get("bandwidth", env.max_bitrate))
-        safe_action = env._sanitize_action(raw_action, semantic_score, bandwidth)
-        decisions.append((t, safe_action, bandwidth, semantic_score))
+def decide_and_encode_segments(input_path, yolo_by_frame, orig_w, orig_h, fps,
+                               workdir, env, qnet, export_qoffsets,
+                               min_roi_confidence=0.40, max_rois=3,
+                               max_roi_fraction=0.35, ffmpeg_bin="ffmpeg",
+                               ffprobe_bin="ffprobe"):
+    """Quyet dinh va encode online theo GOP co dinh ``env.segment_len``.
 
-        # Cap nhat cac truong KHONG phu thuoc ket qua encode that (bandwidth
-        # la dieu kien mang do real-time, resolution la quyet dinh da chon
-        # xong truoc khi encode) -- giong het env.step() lam sau moi buoc.
-        env.prev_bandwidth = bandwidth
-        env.current_resolution_idx = safe_action.resolution_idx
-        env.current_roi_idx = safe_action.roi_idx
-        # LUU Y: prev_bitrate KHONG duoc cap nhat o day -- no chi duoc cap
-        # nhat trong build_and_encode_segments() SAU KHI mot doan duoc encode
-        # that va do duoc bitrate that (xem docstring dau file).
-    return decisions
+    Tat ca frame trong GOP dung cung resolution/ROI (dung sanitize cua env),
+    con target bitrate GOP la trung binh cua ratio[t] * bandwidth[t]. Sau khi
+    GOP encode xong, bitrate do that duoc dua vao observation GOP ke tiep.
+    """
+    segments = []
+    for seg_start in range(0, env.n, env.segment_len):
+        seg_end = min(seg_start + env.segment_len, env.n)
+        frame_actions = []
+        targets = []
+        for t in range(seg_start, seg_end):
+            env.t = t
+            row = env.trace[t]
+            action_idx = greedy_action(qnet, env._get_obs())
+            raw_action = ACTIONS[action_idx]
+            semantic_score = float(row.get("semantic_score", 0.0))
+            bandwidth = float(row.get("bandwidth", env.max_bitrate))
+            safe_action = env._sanitize_action(raw_action, semantic_score, bandwidth)
+            frame_actions.append(safe_action)
+            targets.append(safe_action.bitrate_ratio * bandwidth)
+            env.prev_bandwidth = bandwidth
+            env.current_resolution_idx = safe_action.resolution_idx
+            env.current_roi_idx = safe_action.roi_idx
 
-
-def build_and_encode_segments(input_path, decisions, yolo_by_frame,
-                               orig_w, orig_h, fps, workdir, env,
-                               ffmpeg_bin="ffmpeg", ffprobe_bin="ffprobe"):
-    """Gom cac frame lien tiep co CUNG (resolution_idx, bitrate_ratio, roi_idx)
-    sau sanitize thanh 1 doan ffmpeg vat ly; MOI KHI action
-    doi thi dong doan dang mo, encode that, do bitrate that, cap nhat
-    env.prev_bitrate (dung cho quyet dinh cua CAC DOAN SAU -- xem docstring
-    dau file ve nhan qua), roi bat dau doan moi."""
-    segments = []  # metadata cho concat/bao cao
-    seg_start = 0
-    seg_action = decisions[0][1]
-
-    def close_segment(seg_start, seg_end, action):
-        width, height = RESOLUTIONS[action.resolution_idx]
-        qoffset = ROI_QOFFSET_LEVELS[action.roi_idx]
-        roi_box = (
-            union_roi_for_segment(
-                yolo_by_frame, seg_start, seg_end,
-                orig_w, orig_h, width, height,
+        segment_action = frame_actions[0]
+        requested_w, requested_h = RESOLUTIONS[segment_action.resolution_idx]
+        width, height = fit_resolution(requested_w, requested_h, orig_w, orig_h)
+        policy_qoffset = ROI_QOFFSET_LEVELS[segment_action.roi_idx]
+        applied_qoffset = export_qoffsets[segment_action.roi_idx]
+        roi_boxes = (
+            select_roi_boxes(
+                yolo_by_frame, seg_start, seg_end, orig_w, orig_h, width, height,
+                min_confidence=min_roi_confidence, max_rois=max_rois,
+                max_total_fraction=max_roi_fraction,
             )
-            if abs(qoffset) > 1e-9
-            else None
+            if abs(applied_qoffset) > 1e-9 else []
         )
-
-        # target bitrate = trung binh bitrate_ratio * bandwidth tren toan
-        # doan (bitrate_ratio co dinh trong doan, bandwidth co the doi nhe
-        # frame-to-frame -- lay trung binh de co 1 gia tri -b:v duy nhat
-        # cho ca doan, dung dinh nghia target_bitrate trong env.py dong 279).
-        bw_values = [decisions[i][2] for i in range(seg_start, seg_end)]
-        target_bitrate = action.bitrate_ratio * (sum(bw_values) / len(bw_values))
-
-        tag = f"s{seg_start}_{seg_end}"
+        target_bitrate = max(50.0, min(sum(targets) / len(targets), env.max_bitrate))
         enc_path = encode_segment_abr(
-            input_path, seg_start, seg_end, width, height, roi_box, qoffset,
-            target_bitrate, fps, workdir, tag, ffmpeg_bin=ffmpeg_bin
+            input_path, seg_start, seg_end, width, height, roi_boxes,
+            applied_qoffset, target_bitrate, fps, workdir,
+            f"gop_{seg_start // env.segment_len}", ffmpeg_bin=ffmpeg_bin,
         )
-
-        # Do bitrate THAT (khong phai uoc luong) de cap lai prev_bitrate cho
-        # cac quyet dinh SAU doan nay -- day la buoc thay the duy nhat cho
-        # _simulate_encode()/grid trong env.py.
         real_bitrates = extract_bitrate_per_frame(enc_path, fps, ffprobe_bin=ffprobe_bin)
-        avg_real_bitrate = (sum(real_bitrates) / len(real_bitrates)) if real_bitrates else target_bitrate
+        if len(real_bitrates) != seg_end - seg_start:
+            raise RuntimeError(
+                f"Segment [{seg_start},{seg_end}) encode sai so frame: "
+                f"expected={seg_end - seg_start}, actual={len(real_bitrates)}"
+            )
+        avg_real_bitrate = sum(real_bitrates) / len(real_bitrates)
         env.prev_bitrate = avg_real_bitrate
 
+        unique_ratios = sorted({a.bitrate_ratio for a in frame_actions})
         segments.append({
             "start_frame": seg_start,
             "end_frame": seg_end,
-            "resolution": [width, height],
-            "bitrate_ratio": action.bitrate_ratio,
-            "roi_idx": action.roi_idx,
-            "roi_qoffset": qoffset,
-            "roi_box": list(roi_box) if roi_box is not None else None,
-            "roi_applied": roi_box is not None and abs(qoffset) > 1e-9,
+            "requested_resolution": [requested_w, requested_h],
+            "encoded_resolution": [width, height],
+            "bitrate_ratios": unique_ratios,
+            "roi_idx": segment_action.roi_idx,
+            "policy_roi_qoffset": policy_qoffset,
+            "applied_roi_qoffset": applied_qoffset,
+            "roi_boxes": [list(box) for box in roi_boxes],
+            "roi_applied": bool(roi_boxes) and abs(applied_qoffset) > 1e-9,
             "target_bitrate_kbps": round(target_bitrate, 2),
             "measured_bitrate_kbps": round(avg_real_bitrate, 2),
             "path": enc_path,
         })
         print(
-            f"[segment] frames [{seg_start},{seg_end}) | {width}x{height} | "
-            f"bitrate_ratio={action.bitrate_ratio} | roi_idx={action.roi_idx} "
-            f"qoffset={qoffset} | target={target_bitrate:.0f}kbps "
-            f"measured={avg_real_bitrate:.0f}kbps",
+            f"[gop] frames [{seg_start},{seg_end}) | {width}x{height} | "
+            f"ratios={unique_ratios} | roi_idx={segment_action.roi_idx} "
+            f"qoffset={applied_qoffset} | roi_boxes={len(roi_boxes)} | "
+            f"target={target_bitrate:.0f}kbps measured={avg_real_bitrate:.0f}kbps",
             file=sys.stderr,
         )
-
-    for idx in range(1, len(decisions) + 1):
-        if idx < len(decisions):
-            _, action, _, _ = decisions[idx]
-            changed = (
-                action.resolution_idx != seg_action.resolution_idx
-                or action.bitrate_ratio != seg_action.bitrate_ratio
-                or action.roi_idx != seg_action.roi_idx
-            )
-        else:
-            changed = True  # het trace -> dong doan cuoi cung
-
-        if changed:
-            seg_end = idx
-            close_segment(seg_start, seg_end, seg_action)
-            if idx < len(decisions):
-                seg_start = idx
-                seg_action = decisions[idx][1]
-
     return segments
 
 
-def concat_segments(segments, out_path, target_w, target_h, fps, workdir, ffmpeg_bin="ffmpeg"):
+def concat_segments(segments, out_path, target_w, target_h, fps, workdir,
+                    input_path=None, ffmpeg_bin="ffmpeg"):
     """Cac doan co the khac do phan giai (resolution la quyet dinh cap
     segment), nen phai scale ve 1 do phan giai chung truoc khi noi bang
     filter_complex concat (khong the dung concat demuxer stream-copy vi do
@@ -305,21 +362,48 @@ def concat_segments(segments, out_path, target_w, target_h, fps, workdir, ffmpeg
     for i, seg in enumerate(segments):
         inputs += ["-i", seg["path"]]
         filter_parts.append(
-            f"[{i}:v]scale={target_w}:{target_h}:flags=bicubic,"
-            f"setsar=1,fps={fps:.6f}[v{i}]"
+            f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS,"
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=bicubic,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v{i}]"
         )
     concat_inputs = "".join(f"[v{i}]" for i in range(len(segments)))
     filter_complex = ";".join(filter_parts) + f";{concat_inputs}concat=n={len(segments)}:v=1:a=0[outv]"
 
+    audio_input_idx = len(segments)
+    if input_path is not None:
+        inputs += ["-i", input_path]
+    total_frames = sum(seg["end_frame"] - seg["start_frame"] for seg in segments)
     cmd = [
         ffmpeg_bin, "-y", *inputs,
         "-filter_complex", filter_complex,
         "-map", "[outv]",
         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-pix_fmt", "yuv420p", "-loglevel", "error",
+        "-pix_fmt", "yuv420p", "-r", f"{fps:.6f}", "-fps_mode", "cfr",
+        "-frames:v", str(total_frames),
+    ]
+    if input_path is not None:
+        cmd += ["-map", f"{audio_input_idx}:a:0?", "-c:a", "aac", "-shortest"]
+    cmd += [
+        "-loglevel", "error",
         out_path,
     ]
     run(cmd)
+
+
+def validate_output(path, expected_frames, ffprobe_bin="ffprobe"):
+    out = run([
+        ffprobe_bin, "-v", "error", "-select_streams", "v:0", "-count_frames",
+        "-show_entries", "stream=nb_read_frames,width,height,avg_frame_rate",
+        "-of", "json", path,
+    ]).stdout
+    stream = json.loads(out)["streams"][0]
+    actual_frames = int(stream["nb_read_frames"])
+    if actual_frames != expected_frames:
+        raise RuntimeError(
+            f"Output sai so frame: expected={expected_frames}, actual={actual_frames}. "
+            "File duoc giu lai de debug nhung khong duoc xem la export thanh cong."
+        )
+    return stream
 
 
 def main():
@@ -336,10 +420,15 @@ def main():
                      help="Phai khop max_bitrate_kbps da dung khi train (mac dinh env.py: 8000.0)")
     ap.add_argument("--segment-len", type=int, default=8,
                      help="Phai khop segment_len da dung khi train (mac dinh env.py: 8) "
-                          "-- dieu khien khi nao resolution/ROI duoc phep doi, KHONG phai "
-                          "kich thuoc doan ffmpeg vat ly (xem docstring dau file)")
+                          "-- cung la kich thuoc GOP/doan ffmpeg vat ly")
     ap.add_argument("--concat-width", type=int, default=1920)
     ap.add_argument("--concat-height", type=int, default=1080)
+    ap.add_argument("--export-roi-qoffsets", default="0,-0.05,-0.10",
+                    help="qoffset libx264 an toan ung voi roi_idx 0/1/2")
+    ap.add_argument("--min-roi-confidence", type=float, default=0.40)
+    ap.add_argument("--max-rois", type=int, default=3)
+    ap.add_argument("--max-roi-fraction", type=float, default=0.35,
+                    help="Tong dien tich ROI toi da tren frame (0..1)")
     ap.add_argument("--keep-segments", action="store_true")
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--segments-report", default=None,
@@ -352,6 +441,17 @@ def main():
                      help="Duong dan binary ffprobe, vd: "
                           "../ffmpeg-7.0.2-amd64-static/ffprobe")
     args = ap.parse_args()
+
+    export_qoffsets = [float(v.strip()) for v in args.export_roi_qoffsets.split(",")]
+    if len(export_qoffsets) != len(ROI_QOFFSET_LEVELS):
+        raise ValueError(
+            f"--export-roi-qoffsets can {len(ROI_QOFFSET_LEVELS)} gia tri, "
+            f"nhan duoc {len(export_qoffsets)}"
+        )
+    if export_qoffsets[0] != 0.0 or any(not -1.0 <= q <= 1.0 for q in export_qoffsets):
+        raise ValueError("ROI qoffset phai nam trong [-1,1] va muc roi_idx=0 phai bang 0")
+    if not 0.0 < args.max_roi_fraction <= 1.0:
+        raise ValueError("--max-roi-fraction phai nam trong (0,1]")
 
     fps, orig_w, orig_h, nb_frames = probe_video(args.input, ffprobe_bin=args.ffprobe_bin)
     print(f"[info] input: {args.input} | {orig_w}x{orig_h}@{fps:.3f}fps | {nb_frames} frames",
@@ -373,31 +473,36 @@ def main():
 
     qnet = load_policy(args.policy, env)
 
-    decisions = build_decision_stream(env, qnet)
-    if any(action.roi_idx > 0 for _, action, _, _ in decisions):
-        if not os.path.isfile(args.yolo_metadata):
-            raise FileNotFoundError(
-                "Policy da chon ROI encoding nhung khong tim thay YOLO metadata: "
-                f"{args.yolo_metadata}"
-            )
-        yolo_by_frame = load_yolo_metadata(args.yolo_metadata)
-    else:
-        yolo_by_frame = {}
+    if not os.path.isfile(args.yolo_metadata):
+        raise FileNotFoundError(f"Khong tim thay YOLO metadata: {args.yolo_metadata}")
+    yolo_by_frame = load_export_yolo_metadata(args.yolo_metadata)
 
+    created_temp_workdir = args.workdir is None
     workdir = args.workdir or tempfile.mkdtemp(prefix="policy_export_")
     os.makedirs(workdir, exist_ok=True)
 
-    segments = build_and_encode_segments(
-        args.input, decisions, yolo_by_frame, orig_w, orig_h, fps, workdir, env,
-        ffmpeg_bin=args.ffmpeg_bin, ffprobe_bin=args.ffprobe_bin
+    segments = decide_and_encode_segments(
+        args.input, yolo_by_frame, orig_w, orig_h, fps, workdir, env, qnet,
+        export_qoffsets=export_qoffsets,
+        min_roi_confidence=args.min_roi_confidence,
+        max_rois=max(1, args.max_rois),
+        max_roi_fraction=args.max_roi_fraction,
+        ffmpeg_bin=args.ffmpeg_bin, ffprobe_bin=args.ffprobe_bin,
     )
 
-    print(f"[info] Tong {len(segments)} doan ffmpeg (moi doan = 1 lan action doi that su)",
+    print(f"[info] Tong {len(segments)} GOP ffmpeg (moi GOP toi da {env.segment_len} frame)",
           file=sys.stderr)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-    concat_segments(segments, args.out, args.concat_width, args.concat_height, fps, workdir,
-                     ffmpeg_bin=args.ffmpeg_bin)
+    concat_segments(
+        segments, args.out, args.concat_width, args.concat_height, fps, workdir,
+        input_path=args.input, ffmpeg_bin=args.ffmpeg_bin,
+    )
+    output_stream = validate_output(args.out, env.n, ffprobe_bin=args.ffprobe_bin)
+    print(
+        f"[check] output du {env.n} frame | {output_stream['width']}x{output_stream['height']} "
+        f"| avg_frame_rate={output_stream['avg_frame_rate']}", file=sys.stderr,
+    )
     print(f"[done] Da xuat video: {args.out}", file=sys.stderr)
 
     if args.segments_report:
@@ -405,8 +510,10 @@ def main():
             json.dump(segments, f, ensure_ascii=False, indent=2)
         print(f"[done] Da luu bao cao doan: {args.segments_report}", file=sys.stderr)
 
-    if not args.keep_segments:
+    if not args.keep_segments and created_temp_workdir:
         shutil.rmtree(workdir, ignore_errors=True)
+    elif args.workdir and not args.keep_segments:
+        print(f"[info] Giu lai workdir do nguoi dung chi dinh: {workdir}", file=sys.stderr)
 
 
 if __name__ == "__main__":
