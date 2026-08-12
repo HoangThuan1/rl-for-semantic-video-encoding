@@ -151,7 +151,8 @@ action, nên agent có thể học khi nào nên dành chất lượng cho ROI.
 Grid mới lưu hai metric:
 
 - `vmaf`: VMAF toàn frame.
-- `roi_vmaf`: VMAF chỉ trên union bounding box YOLO của segment.
+- `roi_vmaf`: trung bình VMAF theo diện tích của từng bounding box YOLO trong
+  frame.
 
 QoE dùng cho reward là trung bình có trọng số giữa hai metric. Trọng số ROI
 tăng theo `semantic_score` và `roi_area`:
@@ -182,20 +183,18 @@ semantic score.
 Ở bước `t`, `env.py` lấy:
 
 ```text
-frame_idx = rl_states[t]["frame_idx"]  # fallback về t nếu thiếu
-cell = grid[key][frame_idx % len(grid[key])]
+frame_idx = rl_states[t]["frame_idx"]
+cell = grid[key][frame_idx]
 ```
 
-Các mảng grid được `encode_grid.py` tạo theo từng segment rồi nối lại đúng thứ
-tự từ frame `0` đến `num_frames - 1`. Do đó việc đồng bộ là theo
-`frame_idx`, không phải ghép JSON theo một field nằm trong từng grid cell.
+`encode_grid.py` encode độc lập từng frame và gán một `addroi` riêng cho mỗi
+bbox của đúng frame đó. Do đó việc đồng bộ là theo `frame_idx`, không phải ghép
+JSON theo một field nằm trong từng grid cell.
 
 Để đồng bộ đúng, encode grid và semantic trace phải được tạo từ cùng một
-video, cùng cách đánh số frame từ `0`, và số frame phải khớp. Cần đặc biệt lưu
-ý phép `% len(grid[key])`: nếu trace dài hơn grid, code hiện tại sẽ quay vòng
-grid mà không báo lỗi, làm reward bị ghép nhầm frame. Metadata cấp cao của
-grid có `source_video`, `fps` và `num_frames`; nên kiểm tra chúng trước khi
-train.
+video, cùng cách đánh số frame từ `0`, và số frame phải khớp. Môi trường kiểm
+tra schema, độ dài các curve và biên `frame_idx`; dữ liệu lệch sẽ báo lỗi thay
+vì quay vòng sang frame khác.
 
 ### Reward
 
@@ -307,10 +306,10 @@ Nếu chạy pipeline YOLO/encode grid đầy đủ, cần thêm các gói ngoà
 
 ## 6. Chạy nhanh với trace mô phỏng
 
-Khi chưa có dữ liệu thật, `VCUSimEnv` tự tạo synthetic trace để smoke test:
+Khi chưa có dữ liệu thật, yêu cầu trace synthetic một cách tường minh:
 
 ```bash
-python3 train.py --episodes 300 --output dqn_policy.pt
+python3 train.py --synthetic --episodes 300 --output dqn_policy.pt
 ```
 
 Đánh giá policy:
@@ -352,7 +351,6 @@ python3 encode_grid.py \
   --yolo-metadata ../outputs/metadata/yolo_metadata.jsonl \
   --out ../outputs/metadata/vcu_encode_grid.json \
   --bitrate-levels 600,900,1500,2500,4000,6000 \
-  --segment-frames 25 \
   --workers 4 \
   --metrics vmaf
 
@@ -386,10 +384,17 @@ python3 export_encoded_video.py \
   --segments-report ../outputs/exported_policy_segments.json
 ```
 
-Khi `roi_idx > 0`, exporter lấy union bounding box YOLO trong đoạn, scale về
-resolution đã chọn và áp dụng filter FFmpeg `addroi` với qoffset tương ứng.
+Khi `roi_idx > 0`, exporter giữ từng bounding box YOLO riêng biệt, scale về
+resolution đã chọn và tạo một filter FFmpeg `addroi` cho mỗi ROI với qoffset
+tương ứng.
 Nếu đoạn không có bounding box thì không thể áp dụng ROI và report sẽ ghi
 `"roi_applied": false`.
+
+Vì tọa độ `addroi` của FFmpeg CLI là tĩnh trong một lần gọi filter, exporter
+áp dụng toàn bộ danh sách ROI thu thập trong segment cho mọi frame của segment.
+Muốn ROI chuyển động chính xác trong một GOP liên-frame cần gắn side-data ROI
+vào từng `AVFrame` qua API/GStreamer. Encode grid không dùng xấp xỉ này vì mỗi
+job của grid chỉ chứa đúng một frame.
 
 `evaluate.py` cũng in tỷ lệ `roi0/roi1/roi2` thực sự được áp dụng sau bước
 sanitize để kiểm tra policy có đang sử dụng ROI hay không.
@@ -420,7 +425,8 @@ Các hướng mở rộng tự nhiên cho bài toán:
 
 - Đưa `latency` và `power` vào reward để thành bài toán multi-objective.
 - Thêm state như `prev_vmaf`, `prev_latency`, buffer occupancy hoặc packet loss.
-- Nghiên cứu ROI động theo object/frame thay cho một union box tĩnh trong mỗi segment.
+- Gắn side-data ROI động theo từng `AVFrame` trong pipeline export để vẫn giữ
+  dự đoán liên-frame.
 - Dùng trace mạng thật thay vì synthetic bandwidth.
 - Dùng encode grid đo từ pipeline VCU thật để giảm sai lệch giữa simulation và
   triển khai trên phần cứng.

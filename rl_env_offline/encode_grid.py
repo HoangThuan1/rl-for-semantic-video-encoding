@@ -2,30 +2,15 @@
 """
 encode_grid_roi.py
 -------------------
-Ban mo rong cua encode_grid.py: do rate-distortion that cho tung segment.
+Ban mo rong cua encode_grid.py: do rate-distortion that cho tung frame.
 Moi diem grid la:
-  segment x resolution x bitrate_level x ROI_level -> actual bitrate, VMAF.
+  frame x resolution x bitrate_level x ROI_level -> actual bitrate, VMAF.
 Env action la {Target Bitrate ratio, Resolution, ROI level}; khi tinh reward,
 env noi suy tren duong RD cua dung frame/resolution/ROI level.
 
-TAI SAO LAM THEO DOAN (SEGMENT), KHONG PHAI TUNG FRAME:
-  ffmpeg filter `addroi` KHONG ho tro toa do dong theo frame (da test thuc te:
-  dung bien 'n' -> loi "Undefined constant"; filter cung khong co co "T"
-  (timeline/enable=) hay "C" (runtime command) trong `ffmpeg -filters`). Nghia
-  la 1 lan goi addroi chi ap duoc 1 vung ROI TINH cho ca doan dang encode.
-
-  De ROI thuc su doi theo frame ma van giu nguyen GOP/du doan lien khung That
-  (nhu VCU hardware那 lam qua GstVideoRegionOfInterestMeta cua xlnxroivideo1detect
-  trong pipeline GStreamer/VVAS de xuat sau nay), can ghi thang side-data vao
-  tung AVFrame qua C API -- qua nang cho 1 script offline, va du sao cung
-  khong tai tao dung 100% hardware VCU that.
-
-  Vi day CHI la surrogate offline de train RL (khong phai ban trien khai cuoi),
-  ta chap nhan xap xi: chia video thanh cac DOAN ngan (vd 25 frame ~ 1s),
-  trong moi doan GOM (union) tat ca bbox object thanh 1 vung ROI dai dien,
-  encode rieng doan do bang addroi, roi ghep so lieu tung frame lai. Doi
-  tuong di chuyen it trong ~1s nen xap xi nay chap nhan duoc cho muc dich
-  huan luyen offline.
+Moi job chi encode mot frame, vi vay danh sach ROI cua frame do duoc gan dung
+cho chinh frame do. Moi bbox YOLO tao mot filter `addroi` rieng; khong gom cac
+bbox thanh mot hinh chu nhat lon lam mat ranh gioi object.
 
 CACH DUNG:
   # Chay tu thu muc cnn_training/rl_env_offline.
@@ -33,13 +18,13 @@ CACH DUNG:
       --yolo-metadata ../outputs/metadata/yolo_metadata.jsonl \
       --out ../outputs/metadata/vcu_encode_grid.json \
       --bitrate-levels 600,900,1500,2500,4000,6000 \
-      --segment-frames 25 --workers 4 --metrics vmaf
+      --workers 4 --metrics vmaf
 
   # Smoke test toc do/pipeline, KHONG nen dung de train reward VMAF:
   python3 encode_grid.py --input ../dataset/videos/xxx.mp4 \
       --yolo-metadata ../outputs/metadata/yolo_metadata.jsonl \
       --out /tmp/vcu_encode_grid_smoke.json \
-      --segment-frames 50 --workers 4 --metrics none --preset ultrafast
+      --workers 4 --metrics none --preset ultrafast
 
 KET QUA: file JSON,
   grid["res{i}_br{j}_roi{k}"][frame_idx] =
@@ -50,6 +35,7 @@ KET QUA: file JSON,
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
+import math
 import os
 import subprocess
 import sys
@@ -107,85 +93,118 @@ def load_yolo_metadata(path):
             if not line:
                 continue
             row = json.loads(line)
-            boxes = [d["bbox"] for d in row.get("detections", [])]
+            if "frame_idx" not in row or "width" not in row or "height" not in row:
+                raise ValueError("YOLO metadata thieu frame_idx/width/height")
+            detections = row.get("detections")
+            if not isinstance(detections, list):
+                raise ValueError(
+                    f"YOLO metadata frame {row['frame_idx']} thieu detections list"
+                )
+            boxes = []
+            for detection in detections:
+                bbox = detection.get("bbox")
+                if not isinstance(bbox, list) or len(bbox) != 4:
+                    raise ValueError(
+                        f"YOLO metadata frame {row['frame_idx']} co bbox khong hop le"
+                    )
+                try:
+                    values = [float(value) for value in bbox]
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"YOLO metadata frame {row['frame_idx']} co bbox khong phai so"
+                    ) from exc
+                if not all(math.isfinite(value) for value in values):
+                    raise ValueError(
+                        f"YOLO metadata frame {row['frame_idx']} co bbox khong finite"
+                    )
+                if values[2] <= values[0] or values[3] <= values[1]:
+                    raise ValueError(
+                        f"YOLO metadata frame {row['frame_idx']} co bbox rong/am"
+                    )
+                boxes.append(values)
             out[row["frame_idx"]] = {
                 "width": row["width"], "height": row["height"], "boxes": boxes,
             }
     return out
 
 
-def union_roi_for_segment(yolo_by_frame, start_frame, end_frame, src_w, src_h,
-                           target_w, target_h):
-    """Gom (union) tat ca bbox trong doan [start_frame, end_frame) thanh 1
-    vung hinh chu nhat, roi scale toa do ve do phan giai dich (target_w/h).
-    Tra ve None neu doan nay khong co object nao (khong ap addroi)."""
-    x1s, y1s, x2s, y2s = [], [], [], []
+def roi_boxes_for_frames(yolo_by_frame, start_frame, end_frame, src_w, src_h,
+                         target_w, target_h):
+    """Scale every YOLO bbox in ``[start_frame, end_frame)`` independently.
+
+    The returned rectangles are even-aligned for yuv420p. Repeated rectangles
+    are removed while preserving metadata order, which is also FFmpeg ROI
+    priority order when rectangles overlap.
+    """
+    boxes = []
+    seen = set()
+    sx, sy = target_w / src_w, target_h / src_h
     for fi in range(start_frame, end_frame):
         meta = yolo_by_frame.get(fi)
         if meta is None:
             continue
         for (bx1, by1, bx2, by2) in meta["boxes"]:
-            x1s.append(bx1)
-            y1s.append(by1)
-            x2s.append(bx2)
-            y2s.append(by2)
-    if not x1s:
-        return None
+            left = max(0, min(int(float(bx1) * sx), target_w - 2))
+            top = max(0, min(int(float(by1) * sy), target_h - 2))
+            right = max(left + 2, min(int(round(float(bx2) * sx)), target_w))
+            bottom = max(top + 2, min(int(round(float(by2) * sy)), target_h))
+            left = (left // 2) * 2
+            top = (top // 2) * 2
+            right = min(target_w, ((right + 1) // 2) * 2)
+            bottom = min(target_h, ((bottom + 1) // 2) * 2)
+            box = (left, top, right - left, bottom - top)
+            if box not in seen:
+                seen.add(box)
+                boxes.append(box)
+    return boxes
 
-    x1, y1, x2, y2 = min(x1s), min(y1s), max(x2s), max(y2s)
-    sx, sy = target_w / src_w, target_h / src_h
-    x1, x2 = x1 * sx, x2 * sx
-    y1, y2 = y1 * sy, y2 * sy
-    x1 = max(0, min(int(round(x1)), target_w - 1))
-    y1 = max(0, min(int(round(y1)), target_h - 1))
-    w = max(1, min(int(round(x2 - x1)), target_w - x1))
-    h = max(1, min(int(round(y2 - y1)), target_h - y1))
-    return x1, y1, w, h
+
+def addroi_filter_chain(roi_boxes, qoffset):
+    """Return one addroi filter per ROI; the first ROI wins on overlap."""
+    return "".join(
+        f",addroi=x={x}:y={y}:w={w}:h={h}:qoffset={qoffset}"
+        for x, y, w, h in roi_boxes
+    )
 
 
 def frame_time(frame_idx, fps):
     return f"{frame_idx / fps:.6f}"
 
 
-def encode_segment(input_path, start_frame, end_frame, width, height, roi_box,
-                    qoffset, baseline_crf, fps, workdir, tag, preset="veryfast",
-                    seek_mode="fast", verbose=True, target_bitrate_kbps=None):
-    """Encode 1 doan [start_frame, end_frame) o do phan giai (width,height).
+def encode_frame(input_path, frame_idx, width, height, roi_boxes,
+                 qoffset, fps, workdir, tag, target_bitrate_kbps,
+                 preset="veryfast", seek_mode="fast", verbose=True):
+    """Encode exactly one frame at ``(width, height)``.
 
-    QUAN TRONG: dung CRF (rate-control chu dong), KHONG dung constant-QP
+    QUAN TRONG: dung ABR/VBV (rate-control chu dong), KHONG dung constant-QP
     (`-qp`). Da TEST THUC NGHIEM va xac nhan: o che do `-qp` co dinh, addroi
     hoan toan KHONG co tac dung (2 file voi qoffset khac nhau ra dung 1 kich
     thuoc byte-for-byte), vi constant-QP ep MOI macroblock dung chung 1 QP,
-    khong con cho cho dieu chinh cuc bo theo vung. CRF giu rate-control chu
+    khong con cho cho dieu chinh cuc bo theo vung. ABR giu rate-control chu
     dong nen ROI moi thuc su lam bitrate/chat luong vung do khac vung nen
     (da kiem chung: doi qoffset tu 0 -> -0.9 tren noi dung phuc tap lam
     dung luong file tang ~5 lan trong vung ROI)."""
-    out_path = os.path.join(workdir, f"seg_{tag}_{start_frame}_{end_frame}.mp4")
-    frame_count = max(1, end_frame - start_frame)
+    out_path = os.path.join(workdir, f"frame_{tag}_{frame_idx}.mp4")
     vf = f"scale={width}:{height}:flags=bicubic"
-    if roi_box is not None:
-        x, y, w, h = roi_box
-        vf += f",addroi=x={x}:y={y}:w={w}:h={h}:qoffset={qoffset}"
+    if roi_boxes and abs(qoffset) > 1e-9:
+        vf += addroi_filter_chain(roi_boxes, qoffset)
 
     cmd = ["ffmpeg", "-y"]
     if seek_mode == "fast":
-        cmd += ["-ss", frame_time(start_frame, fps)]
+        cmd += ["-ss", frame_time(frame_idx, fps)]
     cmd += ["-i", input_path]
     if seek_mode == "accurate":
-        cmd += ["-ss", frame_time(start_frame, fps)]
+        cmd += ["-ss", frame_time(frame_idx, fps)]
     cmd += [
         "-vf", vf,
-        "-frames:v", str(frame_count),
+        "-frames:v", "1",
         "-an",
         "-c:v", "libx264", "-preset", preset,
     ]
-    if target_bitrate_kbps is None:
-        cmd += ["-crf", str(baseline_crf)]
-    else:
-        br = max(1, int(round(float(target_bitrate_kbps))))
-        cmd += ["-b:v", f"{br}k", "-maxrate", f"{br}k", "-bufsize", f"{max(2 * br, 1)}k"]
+    br = max(1, int(round(float(target_bitrate_kbps))))
+    cmd += ["-b:v", f"{br}k", "-maxrate", f"{br}k", "-bufsize", f"{max(2 * br, 1)}k"]
     cmd += [
-        "-bf", "0", "-g", str(frame_count),
+        "-bf", "0", "-g", "1",
         "-r", f"{fps:.6f}", "-vsync", "cfr", "-pix_fmt", "yuv420p",
         "-loglevel", "error", out_path,
     ]
@@ -262,16 +281,9 @@ def extract_vmaf_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir
     return vmafs
 
 
-def extract_roi_vmaf_per_frame(encoded_path, reference_path, roi_box,
+def _extract_single_roi_vmaf(encoded_path, reference_path, roi_box,
                                target_w, target_h, workdir, tag, verbose=True):
-    """Tinh VMAF rieng tren union ROI da dung cho addroi.
-
-    Reference duoc scale ve cung resolution encode truoc khi crop. Crop duoc
-    can ve toa do/kich thuoc chan de hop voi pixel format yuv420p.
-    """
-    if roi_box is None:
-        return None
-
+    """Return per-frame VMAF for one already aligned ROI rectangle."""
     x, y, w, h = roi_box
     x = max(0, min((int(x) // 2) * 2, max(target_w - 2, 0)))
     y = max(0, min((int(y) // 2) * 2, max(target_h - 2, 0)))
@@ -303,6 +315,34 @@ def extract_roi_vmaf_per_frame(encoded_path, reference_path, roi_box,
         for frame in report.get("frames", [])
         if "vmaf" in frame.get("metrics", {})
     ]
+
+
+def extract_roi_vmaf_per_frame(encoded_path, reference_path, roi_boxes,
+                               target_w, target_h, workdir, tag, verbose=True):
+    """Measure each ROI independently and return its area-weighted VMAF.
+
+    This keeps the quality metric on detected objects instead of including the
+    background between objects as the old enclosing-union crop did.
+    """
+    if not roi_boxes:
+        return None
+
+    weighted = None
+    total_area = 0.0
+    for roi_index, roi_box in enumerate(roi_boxes):
+        values = _extract_single_roi_vmaf(
+            encoded_path, reference_path, roi_box, target_w, target_h,
+            workdir, f"{tag}_roi{roi_index}", verbose=verbose,
+        )
+        area = float(roi_box[2] * roi_box[3])
+        if weighted is None:
+            weighted = [0.0] * len(values)
+        if len(values) != len(weighted):
+            raise RuntimeError("So frame ROI VMAF khong dong nhat")
+        for i, value in enumerate(values):
+            weighted[i] += value * area
+        total_area += area
+    return [value / total_area for value in weighted]
 
 
 def extract_psnr_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir,
@@ -350,20 +390,17 @@ def _grid_segment_worker(args):
     (
         input_path,
         ref_path,
-        start_f,
-        end_f,
+        frame_idx,
         fps,
         orig_w,
         orig_h,
         width,
         height,
-        roi_box,
+        roi_boxes,
         qoffset,
         target_bitrate_kbps,
-        baseline_crf,
         workdir,
         key,
-        si,
         res_idx,
         br_idx,
         roi_idx,
@@ -374,12 +411,11 @@ def _grid_segment_worker(args):
         keep_files,
     ) = args
 
-    tag = f"r{res_idx}b{br_idx}roi{roi_idx}s{si}"
-    enc_path = encode_segment(
-        input_path, start_f, end_f, width, height, roi_box, qoffset,
-        baseline_crf, fps, workdir, tag, preset=preset,
+    tag = f"r{res_idx}b{br_idx}roi{roi_idx}f{frame_idx}"
+    enc_path = encode_frame(
+        input_path, frame_idx, width, height, roi_boxes, qoffset,
+        fps, workdir, tag, target_bitrate_kbps, preset=preset,
         seek_mode=seek_mode, verbose=verbose,
-        target_bitrate_kbps=target_bitrate_kbps
     )
     try:
         bitrates = extract_bitrate_per_frame(enc_path, fps)
@@ -389,7 +425,7 @@ def _grid_segment_worker(args):
                 enc_path, ref_path, orig_w, orig_h, workdir, tag, verbose=verbose
             )
             roi_vmafs = extract_roi_vmaf_per_frame(
-                enc_path, ref_path, roi_box, width, height, workdir, tag,
+                enc_path, ref_path, roi_boxes, width, height, workdir, tag,
                 verbose=verbose,
             )
             if roi_vmafs is None:
@@ -404,12 +440,16 @@ def _grid_segment_worker(args):
                 enc_path, ref_path, orig_w, orig_h, workdir, tag, verbose=verbose
             )
 
-        n = min(len(bitrates), len(vmafs), len(roi_vmafs), end_f - start_f)
+        lengths = [len(bitrates), len(vmafs), len(roi_vmafs)]
         if psnrs is not None:
-            n = min(n, len(psnrs))
+            lengths.append(len(psnrs))
+        if any(length != 1 for length in lengths):
+            raise RuntimeError(
+                f"Frame {frame_idx}: mong doi dung 1 sample metric, nhan {lengths}"
+            )
 
         rows = []
-        for i in range(n):
+        for i in range(1):
             row = {
                 "bitrate_kbps": round(bitrates[i], 2),
                 "target_bitrate_kbps": round(float(target_bitrate_kbps), 2),
@@ -419,7 +459,7 @@ def _grid_segment_worker(args):
             if psnrs is not None:
                 row["psnr"] = round(psnrs[i], 2)
             rows.append(row)
-        return key, si, rows
+        return key, frame_idx, rows[0]
     finally:
         if not keep_files:
             try:
@@ -428,18 +468,33 @@ def _grid_segment_worker(args):
                 pass
 
 
-def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
-                keep_files=False, workdir=None, workers=1, metrics=("vmaf",),
+def build_grid(input_path, yolo_metadata_path, keep_files=False, workdir=None,
+                workers=1, metrics=("vmaf",),
                 preset="veryfast", ref_preset="ultrafast", seek_mode="fast",
                 verbose=False, bitrate_levels_kbps=None):
-    bitrate_levels_kbps = list(bitrate_levels_kbps or BITRATE_LEVELS_KBPS)
+    bitrate_levels_kbps = list(
+        BITRATE_LEVELS_KBPS if bitrate_levels_kbps is None else bitrate_levels_kbps
+    )
+    if not bitrate_levels_kbps:
+        raise ValueError("bitrate_levels_kbps khong duoc rong")
     fps, orig_w, orig_h, nb_frames = probe_video(input_path)
     yolo_by_frame = load_yolo_metadata(yolo_metadata_path)
+    missing_frames = sorted(set(range(nb_frames)) - set(yolo_by_frame))
+    if missing_frames:
+        raise ValueError(
+            "YOLO metadata thieu frame: "
+            + ",".join(str(value) for value in missing_frames[:10])
+        )
+    for frame_idx in range(nb_frames):
+        metadata = yolo_by_frame[frame_idx]
+        if (int(metadata["width"]), int(metadata["height"])) != (orig_w, orig_h):
+            raise ValueError(
+                f"YOLO metadata frame {frame_idx} co kich thuoc "
+                f"{metadata['width']}x{metadata['height']}, video la {orig_w}x{orig_h}"
+            )
     print(f"[info] input: {input_path} | {orig_w}x{orig_h}@{fps:.3f}fps | "
-          f"{nb_frames} frames | segment={segment_frames} frames "
-          f"(~{segment_frames/fps:.2f}s)", file=sys.stderr)
-    print(f"[info] ROI qoffset levels: {ROI_QOFFSET_LEVELS} | baseline_crf={baseline_crf}",
-          file=sys.stderr)
+          f"{nb_frames} frame-level jobs", file=sys.stderr)
+    print(f"[info] ROI qoffset levels: {ROI_QOFFSET_LEVELS}", file=sys.stderr)
     print(f"[info] bitrate levels kbps: {bitrate_levels_kbps}", file=sys.stderr)
     print(f"[info] workers={workers} | metrics={','.join(metrics) or 'none'} | "
           f"preset={preset} | seek_mode={seek_mode}", file=sys.stderr)
@@ -448,40 +503,37 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
     wd = workdir or tmp_ctx.name
     os.makedirs(wd, exist_ok=True)
 
-    boundaries = list(range(0, nb_frames, segment_frames)) + [nb_frames]
-    segments = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
     roi_cache = {}
     for res_idx, (w, h) in enumerate(RESOLUTIONS):
-        for si, (start_f, end_f) in enumerate(segments):
-            roi_cache[(res_idx, si)] = union_roi_for_segment(
-                yolo_by_frame, start_f, end_f, orig_w, orig_h, w, h
+        for frame_idx in range(nb_frames):
+            roi_cache[(res_idx, frame_idx)] = roi_boxes_for_frames(
+                yolo_by_frame, frame_idx, frame_idx + 1,
+                orig_w, orig_h, w, h
             )
 
     grid = {}
     ref_paths = {}
     try:
         if metrics:
-            print(f"[ref] tao {len(segments)} reference segments mot lan de dung lai",
+            print(f"[ref] tao {nb_frames} reference frames mot lan de dung lai",
                   file=sys.stderr)
             ref_tasks = [
-                (
-                    input_path, start_f, end_f, orig_w, orig_h, fps, wd, si,
-                    ref_preset, seek_mode, verbose,
-                )
-                for si, (start_f, end_f) in enumerate(segments)
+                (input_path, frame_idx, frame_idx + 1, orig_w, orig_h, fps,
+                 wd, frame_idx, ref_preset, seek_mode, verbose)
+                for frame_idx in range(nb_frames)
             ]
             if workers > 1:
                 with ProcessPoolExecutor(max_workers=workers) as ex:
                     futures = [ex.submit(_build_ref_worker, task) for task in ref_tasks]
                     for done, fut in enumerate(as_completed(futures), 1):
-                        si, ref_path = fut.result()
-                        ref_paths[si] = ref_path
+                        frame_idx, ref_path = fut.result()
+                        ref_paths[frame_idx] = ref_path
                         if done % 25 == 0 or done == len(futures):
                             print(f"[ref] {done}/{len(futures)}", file=sys.stderr)
             else:
                 for done, task in enumerate(ref_tasks, 1):
-                    si, ref_path = _build_ref_worker(task)
-                    ref_paths[si] = ref_path
+                    frame_idx, ref_path = _build_ref_worker(task)
+                    ref_paths[frame_idx] = ref_path
                     if done % 25 == 0 or done == len(ref_tasks):
                         print(f"[ref] {done}/{len(ref_tasks)}", file=sys.stderr)
 
@@ -491,34 +543,27 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
                     grid[f"res{res_idx}_br{br_idx}_roi{roi_idx}"] = []
 
         tasks = []
-        copy_from_base = []
         for res_idx, (w, h) in enumerate(RESOLUTIONS):
-            for si, (start_f, end_f) in enumerate(segments):
-                roi_box = roi_cache[(res_idx, si)]
+            for frame_idx in range(nb_frames):
+                roi_boxes = roi_cache[(res_idx, frame_idx)]
                 for br_idx, target_bitrate_kbps in enumerate(bitrate_levels_kbps):
                     for roi_idx, qoffset in enumerate(ROI_QOFFSET_LEVELS):
                         key = f"res{res_idx}_br{br_idx}_roi{roi_idx}"
-                        if roi_box is None and roi_idx > 0:
-                            copy_from_base.append((key, f"res{res_idx}_br{br_idx}_roi0", si))
-                            continue
                         tasks.append(
                             (
                                 input_path,
-                                ref_paths.get(si),
-                                start_f,
-                                end_f,
+                                ref_paths[frame_idx] if metrics else None,
+                                frame_idx,
                                 fps,
                                 orig_w,
                                 orig_h,
                                 w,
                                 h,
-                                roi_box,
+                                roi_boxes,
                                 qoffset,
                                 target_bitrate_kbps,
-                                baseline_crf,
                                 wd,
                                 key,
-                                si,
                                 res_idx,
                                 br_idx,
                                 roi_idx,
@@ -530,36 +575,28 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
                             )
                         )
 
-        print(f"[encode] {len(tasks)} jobs encode/metric "
-              f"(bo qua {len(copy_from_base)} jobs trung lap do segment khong co ROI)",
-              file=sys.stderr)
-        segment_rows = {}
+        print(f"[encode] {len(tasks)} frame-level jobs encode/metric", file=sys.stderr)
+        frame_rows = {}
         if workers > 1:
             with ProcessPoolExecutor(max_workers=workers) as ex:
                 futures = [ex.submit(_grid_segment_worker, task) for task in tasks]
                 for done, fut in enumerate(as_completed(futures), 1):
-                    key, si, rows = fut.result()
-                    segment_rows[(key, si)] = rows
+                    key, frame_idx, row = fut.result()
+                    frame_rows[(key, frame_idx)] = row
                     if done % 25 == 0 or done == len(futures):
                         print(f"[encode] {done}/{len(futures)}", file=sys.stderr)
         else:
             for done, task in enumerate(tasks, 1):
-                key, si, rows = _grid_segment_worker(task)
-                segment_rows[(key, si)] = rows
+                key, frame_idx, row = _grid_segment_worker(task)
+                frame_rows[(key, frame_idx)] = row
                 if done % 25 == 0 or done == len(tasks):
                     print(f"[encode] {done}/{len(tasks)}", file=sys.stderr)
-
-        for key, base_key, si in copy_from_base:
-            segment_rows[(key, si)] = list(segment_rows[(base_key, si)])
 
         for res_idx, _ in enumerate(RESOLUTIONS):
             for br_idx, _ in enumerate(bitrate_levels_kbps):
                 for roi_idx, _ in enumerate(ROI_QOFFSET_LEVELS):
                     key = f"res{res_idx}_br{br_idx}_roi{roi_idx}"
-                    rows = []
-                    for si in range(len(segments)):
-                        rows.extend(segment_rows[(key, si)])
-                    grid[key] = rows
+                    grid[key] = [frame_rows[(key, fi)] for fi in range(nb_frames)]
     finally:
         if metrics and not keep_files:
             for ref_path in ref_paths.values():
@@ -574,17 +611,13 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
         "source_video": os.path.abspath(input_path),
         "fps": fps,
         "num_frames": nb_frames,
-        "segment_frames": segment_frames,
+        "grid_unit": "frame",
         "resolutions": RESOLUTIONS,
         "bitrate_levels_kbps": bitrate_levels_kbps,
         "roi_qoffset_levels": ROI_QOFFSET_LEVELS,
-        "baseline_crf": baseline_crf,
         "metrics": list(metrics),
         "encode_preset": preset,
         "seek_mode": seek_mode,
-        "min_qp": baseline_crf,   # giu ten khop voi env.py cu (fallback, khong dung de tra QP tuyet doi nua)
-        "max_qp": baseline_crf,
-        "qp_levels": ROI_QOFFSET_LEVELS,  # ten cu, gio la qoffset -- xem "roi_qoffset_levels" cho ro nghia
         "grid": grid,
     }
 
@@ -622,17 +655,10 @@ def main():
     ap.add_argument("--yolo-metadata", default=YOLO_METADATA,
                      help="File jsonl co truong 'detections'[].bbox theo tung frame_idx")
     ap.add_argument("--out", default=ENCODE_GRID)
-    ap.add_argument("--baseline-crf", type=int, default=28,
-                     help="CRF nen (background) cho ca luoi -- PHAI dung CRF (rate-control "
-                          "chu dong), KHONG dung constant-QP, vi da kiem chung constant-QP "
-                          "lam addroi/ROI mat tac dung hoan toan. bitrate_ratio trong action "
-                          "van dieu chinh tong bitrate qua VBV cap sau khi tra bang.")
     ap.add_argument("--bitrate-levels", type=parse_float_list,
                      default=BITRATE_LEVELS_KBPS,
                      help="Cac muc bitrate kbps de do duong rate-distortion, vd "
                           "600,900,1500,2500,4000,6000")
-    ap.add_argument("--segment-frames", type=int, default=25,
-                     help="So frame moi doan (ROI tinh trong 1 doan). 25 ~ 1s o 25fps")
     ap.add_argument("--keep-files", action="store_true")
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--workers", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)),
@@ -657,8 +683,8 @@ def main():
     out_path = args.out
     workdir = args.workdir
 
-    result = build_grid(input_path, yolo_metadata_path, args.baseline_crf,
-                         args.segment_frames, keep_files=args.keep_files,
+    result = build_grid(input_path, yolo_metadata_path,
+                         keep_files=args.keep_files,
                          workdir=workdir, workers=max(1, args.workers),
                          metrics=args.metrics, preset=args.preset,
                          ref_preset=args.ref_preset, seek_mode=args.seek_mode,

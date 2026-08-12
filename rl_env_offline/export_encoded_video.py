@@ -69,7 +69,11 @@ from env import (  # noqa: E402  (thu vien that cua ban, khong viet lai)
     ROI_QOFFSET_LEVELS,
     VCUSimEnv,
 )
-from encode_grid import load_yolo_metadata, union_roi_for_segment  # noqa: E402
+from encode_grid import (  # noqa: E402
+    addroi_filter_chain,
+    load_yolo_metadata,
+    roi_boxes_for_frames,
+)
 from train import QNetwork, _torch_load_checkpoint  # noqa: E402
 
 
@@ -124,14 +128,13 @@ def extract_bitrate_per_frame(encoded_path, fps, ffprobe_bin="ffprobe"):
 # CRF la lua chon dung cho export that -- ban da tu xac nhan dung ABR).
 # ---------------------------------------------------------------------------
 def encode_segment_abr(input_path, start_frame, end_frame, width, height,
-                        roi_box, qoffset, target_bitrate_kbps, fps, workdir, tag,
+                        roi_boxes, qoffset, target_bitrate_kbps, fps, workdir, tag,
                         ffmpeg_bin="ffmpeg"):
     out_path = os.path.join(workdir, f"seg_{tag}_{start_frame}_{end_frame}.mp4")
     select_expr = f"between(n\\,{start_frame}\\,{end_frame - 1})"
     vf = f"select='{select_expr}',setpts=N/FRAME_RATE/TB,scale={width}:{height}:flags=bicubic"
-    if roi_box is not None and abs(qoffset) > 1e-9:
-        x, y, w, h = roi_box
-        vf += f",addroi=x={x}:y={y}:w={w}:h={h}:qoffset={qoffset}"
+    if roi_boxes and abs(qoffset) > 1e-9:
+        vf += addroi_filter_chain(roi_boxes, qoffset)
 
     b_v = max(50.0, target_bitrate_kbps)
     maxrate = b_v * 1.2
@@ -192,8 +195,8 @@ def build_decision_stream(env, qnet):
         obs = env._get_obs()
         action_idx = greedy_action(qnet, obs)
         raw_action = ACTIONS[action_idx]
-        semantic_score = float(row.get("semantic_score", 0.0))
-        bandwidth = float(row.get("bandwidth", env.max_bitrate))
+        semantic_score = float(row["semantic_score"])
+        bandwidth = float(row["bandwidth"])
         safe_action = env._sanitize_action(raw_action, semantic_score, bandwidth)
         decisions.append((t, safe_action, bandwidth, semantic_score))
 
@@ -224,13 +227,13 @@ def build_and_encode_segments(input_path, decisions, yolo_by_frame,
     def close_segment(seg_start, seg_end, action):
         width, height = RESOLUTIONS[action.resolution_idx]
         qoffset = ROI_QOFFSET_LEVELS[action.roi_idx]
-        roi_box = (
-            union_roi_for_segment(
+        roi_boxes = (
+            roi_boxes_for_frames(
                 yolo_by_frame, seg_start, seg_end,
                 orig_w, orig_h, width, height,
             )
             if abs(qoffset) > 1e-9
-            else None
+            else []
         )
 
         # target bitrate = trung binh bitrate_ratio * bandwidth tren toan
@@ -242,7 +245,7 @@ def build_and_encode_segments(input_path, decisions, yolo_by_frame,
 
         tag = f"s{seg_start}_{seg_end}"
         enc_path = encode_segment_abr(
-            input_path, seg_start, seg_end, width, height, roi_box, qoffset,
+            input_path, seg_start, seg_end, width, height, roi_boxes, qoffset,
             target_bitrate, fps, workdir, tag, ffmpeg_bin=ffmpeg_bin
         )
 
@@ -250,7 +253,11 @@ def build_and_encode_segments(input_path, decisions, yolo_by_frame,
         # cac quyet dinh SAU doan nay -- day la buoc thay the duy nhat cho
         # _simulate_encode()/grid trong env.py.
         real_bitrates = extract_bitrate_per_frame(enc_path, fps, ffprobe_bin=ffprobe_bin)
-        avg_real_bitrate = (sum(real_bitrates) / len(real_bitrates)) if real_bitrates else target_bitrate
+        if not real_bitrates:
+            raise RuntimeError(
+                f"FFprobe khong tra ve bitrate cho segment [{seg_start},{seg_end})"
+            )
+        avg_real_bitrate = sum(real_bitrates) / len(real_bitrates)
         env.prev_bitrate = avg_real_bitrate
 
         segments.append({
@@ -260,8 +267,9 @@ def build_and_encode_segments(input_path, decisions, yolo_by_frame,
             "bitrate_ratio": action.bitrate_ratio,
             "roi_idx": action.roi_idx,
             "roi_qoffset": qoffset,
-            "roi_box": list(roi_box) if roi_box is not None else None,
-            "roi_applied": roi_box is not None and abs(qoffset) > 1e-9,
+            "roi_boxes": [list(box) for box in roi_boxes],
+            "roi_count": len(roi_boxes),
+            "roi_applied": bool(roi_boxes) and abs(qoffset) > 1e-9,
             "target_bitrate_kbps": round(target_bitrate, 2),
             "measured_bitrate_kbps": round(avg_real_bitrate, 2),
             "path": enc_path,
@@ -381,6 +389,12 @@ def main():
                 f"{args.yolo_metadata}"
             )
         yolo_by_frame = load_yolo_metadata(args.yolo_metadata)
+        missing_frames = sorted(set(range(env.n)) - set(yolo_by_frame))
+        if missing_frames:
+            raise ValueError(
+                "YOLO metadata thieu frame can export: "
+                + ",".join(str(value) for value in missing_frames[:10])
+            )
     else:
         yolo_by_frame = {}
 
