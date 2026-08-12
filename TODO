@@ -1,0 +1,3 @@
+Sửa:  Gán QP-offset cho từng ROI
+      Xóa các cơ chế fallback không cần thiết
+      Cách làm việc với từng frame khi tạo encode_grid thay vì segment. Tạo segment thì tìm hiểu xem gán QP-offset cho từng ROI xử lý thế nào trong segment.
