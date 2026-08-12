@@ -5,7 +5,8 @@ Env nay dung state gon cho Semantic-aware Bitrate Control:
 Reward theo cong thuc R = 0.6 * QoE_norm - 0.4 * bitrate_cost.
 Action duoc roi rac hoa de hop voi DQN va duoc "sanitize" truoc khi dua vao
 surrogate VCU, tranh de policy xung dot voi rate control cap thap cua encoder.
-Resolution duoc xem la quyet dinh cap segment/GOP, khong phai thay tung frame.
+Resolution va ROI qoffset duoc xem la quyet dinh cap segment/GOP, khong phai
+thay tung frame.
 """
 
 import json
@@ -22,6 +23,8 @@ from gymnasium import spaces
 RESOLUTIONS = [(640, 480), (1280, 720), (1920, 1080)]
 BITRATE_RATIOS = [0.50, 0.75, 0.95]
 RESOLUTION_ACTIONS = [0, 1, 2]
+ROI_QOFFSET_LEVELS = [0.0, -0.3, -0.6]
+ROI_ACTIONS = list(range(len(ROI_QOFFSET_LEVELS)))
 
 SEMANTIC_SCORE_MAX = 30.0
 MOTION_MAX = 1.0
@@ -38,12 +41,13 @@ DEFAULT_YOLO_METADATA_PATH = "outputs/metadata/yolo_metadata.jsonl"
 class EncoderAction:
     bitrate_ratio: float
     resolution_idx: int
+    roi_idx: int
 
 
 ACTIONS = [
-    EncoderAction(bitrate_ratio, resolution_idx)
-    for bitrate_ratio, resolution_idx in product(
-        BITRATE_RATIOS, RESOLUTION_ACTIONS
+    EncoderAction(bitrate_ratio, resolution_idx, roi_idx)
+    for bitrate_ratio, resolution_idx, roi_idx in product(
+        BITRATE_RATIOS, RESOLUTION_ACTIONS, ROI_ACTIONS
     )
 ]
 
@@ -199,7 +203,7 @@ class VCUSimEnv(gym.Env):
       [bandwidth, prev_bitrate, semantic_score]
 
     Action:
-      index roi rac trong ACTIONS = bitrate target ratio x resolution.
+      index roi rac trong ACTIONS = bitrate target ratio x resolution x ROI qoffset.
     """
 
     metadata = {"render_modes": []}
@@ -242,12 +246,22 @@ class VCUSimEnv(gym.Env):
 
         self.grid = load_encode_grid(encode_grid_path) if encode_grid_path else None
         self.grid_qp_levels = self.grid.get("qp_levels") if self.grid else None
+        if self.grid is not None:
+            grid_roi_levels = self.grid.get(
+                "roi_qoffset_levels", self.grid_qp_levels
+            )
+            if grid_roi_levels is not None and list(grid_roi_levels) != ROI_QOFFSET_LEVELS:
+                raise ValueError(
+                    "ROI levels cua encode grid khong khop env: "
+                    f"grid={list(grid_roi_levels)}, env={ROI_QOFFSET_LEVELS}."
+                )
 
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.STATE_DIM,), dtype=np.float32)
         self.action_space = spaces.Discrete(self.NUM_ACTIONS)
 
         self.t = 0
         self.current_resolution_idx = 1
+        self.current_roi_idx = 0
         self.prev_bitrate = 0.0
         self.prev_vmaf = 0.0
         self.prev_latency = 0.0
@@ -258,6 +272,7 @@ class VCUSimEnv(gym.Env):
         super().reset(seed=seed)
         self.t = 0
         self.current_resolution_idx = 1
+        self.current_roi_idx = 0
         self.prev_bandwidth = self.trace[0].get("bandwidth", self.max_bitrate * 0.5)
         self.prev_bitrate = min(self.prev_bandwidth * 0.7, self.max_bitrate)
         self.prev_vmaf = 70.0
@@ -281,7 +296,8 @@ class VCUSimEnv(gym.Env):
 
         if self.grid is not None:
             actual_bitrate, vmaf, latency, power = self._encode_from_grid(
-                safe_action, target_bitrate, row.get("frame_idx", self.t), semantic_score, width, height
+                safe_action, target_bitrate, row.get("frame_idx", self.t),
+                semantic_score, roi_area, width, height
             )
         else:
             actual_bitrate, vmaf, latency, power = self._simulate_encode(
@@ -299,6 +315,7 @@ class VCUSimEnv(gym.Env):
         self.prev_latency = latency
         self.prev_action_idx = action_idx
         self.current_resolution_idx = safe_action.resolution_idx
+        self.current_roi_idx = safe_action.roi_idx
 
         self.t += 1
         if self.t >= self.n:
@@ -319,6 +336,8 @@ class VCUSimEnv(gym.Env):
             "latency": latency,
             "power": power,
             "resolution": (width, height),
+            "roi_idx": safe_action.roi_idx,
+            "roi_qoffset": ROI_QOFFSET_LEVELS[safe_action.roi_idx],
             "semantic_score": semantic_score,
             "roi_area": roi_area,
             **reward_terms,
@@ -341,6 +360,7 @@ class VCUSimEnv(gym.Env):
     def _sanitize_action(self, action, semantic_score, bandwidth):
         bitrate_ratio = min(action.bitrate_ratio, 0.95)
         resolution_idx = action.resolution_idx
+        roi_idx = int(np.clip(action.roi_idx, 0, len(ROI_QOFFSET_LEVELS) - 1))
 
         if bandwidth < 300.0:
             resolution_idx = min(resolution_idx, 1)
@@ -351,24 +371,38 @@ class VCUSimEnv(gym.Env):
         if semantic_score > 0.85 * SEMANTIC_SCORE_MAX and bandwidth > 2500.0:
             resolution_idx = max(resolution_idx, 1)
 
-        # Model resolution as a segment/GOP-level decision to avoid rapid reconfigure.
+        # Resolution va ROI qoffset la quyet dinh cap segment/GOP.
         if self.t % self.segment_len != 0:
             resolution_idx = self.current_resolution_idx
+            roi_idx = self.current_roi_idx
 
-        return EncoderAction(bitrate_ratio, resolution_idx)
+        return EncoderAction(bitrate_ratio, resolution_idx, roi_idx)
 
-    def _encode_from_grid(self, action, target_bitrate, frame_idx, semantic_score, width, height):
-        qp_idx = 0
-        key = f"res{action.resolution_idx}_qp{qp_idx}"
-        frames = self.grid["grid"][key]
-        cell = frames[int(frame_idx) % len(frames)]
-
-        demanded_bitrate = float(cell["bitrate_kbps"])
-        actual_bitrate = float(np.clip(min(demanded_bitrate, target_bitrate), 50.0, self.max_bitrate))
-        vmaf = self._cell_vmaf(cell)
+    def _encode_from_grid(self, action, target_bitrate, frame_idx, semantic_score,
+                          roi_area, width, height):
+        actual_bitrate = float(np.clip(target_bitrate, 50.0, self.max_bitrate))
+        if "bitrate_levels_kbps" in self.grid:
+            global_vmaf, roi_vmaf = self._interpolate_grid_vmaf(
+                action.resolution_idx,
+                frame_idx,
+                actual_bitrate,
+                roi_idx=action.roi_idx,
+            )
+            semantic_norm = np.clip(semantic_score / SEMANTIC_SCORE_MAX, 0.0, 1.0)
+            roi_weight = semantic_norm * np.clip(roi_area * 3.0, 0.0, 0.75)
+            vmaf = float((1.0 - roi_weight) * global_vmaf + roi_weight * roi_vmaf)
+        else:
+            qp_idx = action.roi_idx
+            key = f"res{action.resolution_idx}_qp{qp_idx}"
+            frames = self.grid["grid"][key]
+            cell = frames[int(frame_idx) % len(frames)]
+            grid_bitrate = float(cell["bitrate_kbps"])
+            grid_vmaf = self._cell_vmaf(cell)
+            vmaf = self._adjust_vmaf_for_bitrate(grid_vmaf, grid_bitrate, actual_bitrate)
 
         pixels = width * height
-        complexity = 1.0 + 0.08 * min(semantic_score, SEMANTIC_SCORE_MAX)
+        roi_strength = action.roi_idx / max(len(ROI_QOFFSET_LEVELS) - 1, 1)
+        complexity = 1.0 + 0.08 * min(semantic_score, SEMANTIC_SCORE_MAX) + 0.08 * roi_strength
         latency = 5.0 + (pixels / (1920 * 1080)) * 25.0 * complexity
         power = 0.5 + 1.2 * (pixels / (1920 * 1080)) ** 0.8 * complexity
         return actual_bitrate, vmaf, latency, power
@@ -377,14 +411,20 @@ class VCUSimEnv(gym.Env):
         pixels = width * height
         res_factor = pixels / (1920 * 1080)
         semantic_norm = np.clip(semantic_score / SEMANTIC_SCORE_MAX, 0.0, 1.0)
-        complexity = 1.0 + 0.65 * motion + 0.55 * roi_area + 0.25 * semantic_norm
+        roi_strength = action.roi_idx / max(len(ROI_QOFFSET_LEVELS) - 1, 1)
+        complexity = (
+            1.0 + 0.65 * motion + 0.55 * roi_area
+            + 0.25 * semantic_norm + 0.08 * roi_strength
+        )
 
         demanded_bitrate = self.max_bitrate * res_factor * complexity * 0.42
         actual_bitrate = float(np.clip(min(demanded_bitrate, target_bitrate), 50.0, self.max_bitrate))
 
         bitrate_gain = 17.0 * math.log10(max(actual_bitrate, 50.0) / 350.0)
         resolution_gain = 16.0 * math.log10(max(res_factor, 0.12) / 0.12)
-        vmaf = 58.0 + bitrate_gain + resolution_gain - 9.0 * motion
+        roi_relevance = semantic_norm * np.clip(roi_area * 3.0, 0.0, 1.0)
+        roi_quality_gain = 6.0 * roi_strength * roi_relevance
+        vmaf = 58.0 + bitrate_gain + resolution_gain - 9.0 * motion + roi_quality_gain
         vmaf = float(np.clip(vmaf, 0.0, 100.0))
 
         latency = 5.0 + 25.0 * res_factor * complexity
@@ -396,6 +436,84 @@ class VCUSimEnv(gym.Env):
         if "vmaf" in cell:
             return float(cell["vmaf"])
         raise KeyError("Encode grid thieu field 'vmaf'. Hay chay lai encode_grid.py de tao grid VMAF.")
+
+    @staticmethod
+    def _cell_roi_vmaf(cell, roi_idx):
+        if "roi_vmaf" in cell:
+            return float(cell["roi_vmaf"])
+        if roi_idx == 0:
+            return float(cell["vmaf"])
+        raise KeyError(
+            "Encode grid thieu field 'roi_vmaf' cho ROI action. "
+            "Hay chay lai encode_grid.py ban moi de train policy 27 action."
+        )
+
+    def _interpolate_grid_vmaf(self, resolution_idx, frame_idx, target_bitrate, roi_idx=0):
+        points = []
+        bitrate_levels = self.grid.get("bitrate_levels_kbps", [])
+        for br_idx, _ in enumerate(bitrate_levels):
+            key = f"res{resolution_idx}_br{br_idx}_roi{roi_idx}"
+            frames = self.grid["grid"].get(key)
+            if not frames:
+                continue
+            cell = frames[int(frame_idx) % len(frames)]
+            points.append((
+                float(cell["bitrate_kbps"]),
+                self._cell_vmaf(cell),
+                self._cell_roi_vmaf(cell, roi_idx),
+            ))
+
+        if not points:
+            raise KeyError(
+                "Encode grid thieu RD curve cho "
+                f"resolution_idx={resolution_idx}, roi_idx={roi_idx}."
+            )
+
+        points.sort(key=lambda p: p[0])
+        bitrates = np.array([p[0] for p in points], dtype=np.float32)
+        vmafs = np.array([p[1] for p in points], dtype=np.float32)
+        roi_vmafs = np.array([p[2] for p in points], dtype=np.float32)
+        unique_bitrates, unique_indices = np.unique(bitrates, return_index=True)
+        unique_vmafs = vmafs[unique_indices]
+        unique_roi_vmafs = roi_vmafs[unique_indices]
+
+        if len(unique_bitrates) == 1:
+            return (
+                float(np.clip(unique_vmafs[0], 0.0, 100.0)),
+                float(np.clip(unique_roi_vmafs[0], 0.0, 100.0)),
+            )
+
+        interp_vmaf = np.interp(
+            float(target_bitrate),
+            unique_bitrates,
+            unique_vmafs,
+            left=unique_vmafs[0],
+            right=unique_vmafs[-1],
+        )
+        interp_roi_vmaf = np.interp(
+            float(target_bitrate),
+            unique_bitrates,
+            unique_roi_vmafs,
+            left=unique_roi_vmafs[0],
+            right=unique_roi_vmafs[-1],
+        )
+        return (
+            float(np.clip(interp_vmaf, 0.0, 100.0)),
+            float(np.clip(interp_roi_vmaf, 0.0, 100.0)),
+        )
+
+    @staticmethod
+    def _adjust_vmaf_for_bitrate(grid_vmaf, grid_bitrate, actual_bitrate):
+        """Dua VMAF grid ve dung bitrate ma action yeu cau.
+
+        encode_grid do VMAF tai bitrate thuc cua cell. Khi policy chon
+        bitrate_ratio khac, reward phai dung VMAF tuong ung voi actual_bitrate
+        sau action, khong dung nguyen VMAF cua cell baseline.
+        """
+        safe_grid_bitrate = max(float(grid_bitrate), 50.0)
+        safe_actual_bitrate = max(float(actual_bitrate), 50.0)
+        bitrate_delta = 17.0 * math.log10(safe_actual_bitrate / safe_grid_bitrate)
+        return float(np.clip(float(grid_vmaf) + bitrate_delta, 0.0, 100.0))
 
     def _compute_reward(self, vmaf, actual_bitrate):
         qoe_norm = np.clip(vmaf / 100.0, 0.0, 1.0)

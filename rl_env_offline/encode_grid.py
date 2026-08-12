@@ -2,10 +2,11 @@
 """
 encode_grid_roi.py
 -------------------
-Ban mo rong cua encode_grid.py: thay vi 1 QP dong nhat ca khung hinh, dung
-QP KHAC NHAU giua vung ROI (object YOLO phat hien) va nen. Day la grid encode
-offline; env action hien tai KHONG con ROI strength/qoffset, chi con
-{Target Bitrate ratio, Resolution} = 3x3 = 9 hanh dong.
+Ban mo rong cua encode_grid.py: do rate-distortion that cho tung segment.
+Moi diem grid la:
+  segment x resolution x bitrate_level x ROI_level -> actual bitrate, VMAF.
+Env action la {Target Bitrate ratio, Resolution, ROI level}; khi tinh reward,
+env noi suy tren duong RD cua dung frame/resolution/ROI level.
 
 TAI SAO LAM THEO DOAN (SEGMENT), KHONG PHAI TUNG FRAME:
   ffmpeg filter `addroi` KHONG ho tro toa do dong theo frame (da test thuc te:
@@ -30,8 +31,9 @@ CACH DUNG:
   # Chay tu thu muc cnn_training/rl_env_offline.
   python3 encode_grid.py --input ../dataset/videos/xxx.mp4 \
       --yolo-metadata ../outputs/metadata/yolo_metadata.jsonl \
-      --out ../outputs/metadata/vcu_encode_grid_roi.json \
-      --baseline-crf 28 --segment-frames 25 --workers 4 --metrics vmaf
+      --out ../outputs/metadata/vcu_encode_grid.json \
+      --bitrate-levels 600,900,1500,2500,4000,6000 \
+      --segment-frames 25 --workers 4 --metrics vmaf
 
   # Smoke test toc do/pipeline, KHONG nen dung de train reward VMAF:
   python3 encode_grid.py --input ../dataset/videos/xxx.mp4 \
@@ -39,12 +41,10 @@ CACH DUNG:
       --out /tmp/vcu_encode_grid_smoke.json \
       --segment-frames 50 --workers 4 --metrics none --preset ultrafast
 
-KET QUA: file JSON, grid["res{i}_qp{j}"][frame_idx] = {bitrate_kbps, vmaf}
+KET QUA: file JSON,
+  grid["res{i}_br{j}_roi{k}"][frame_idx] =
+      {bitrate_kbps, target_bitrate_kbps, vmaf, roi_vmaf}
   Neu chay --metrics vmaf,psnr thi moi row co them field psnr.
-  -- giu NGUYEN cau truc nhu encode_grid.py de load_encode_grid()/env.py
-  dung lai duoc, chi khac o CHO "qp{j}" gio la MUC DO ROI (qoffset), khong
-  phai QP tuyet doi -- xem "roi_qoffset_levels" va "baseline_qp" trong file
-  JSON de biet ro.
 """
 
 import argparse
@@ -57,12 +57,13 @@ import tempfile
 
 RESOLUTIONS = [(640, 480), (1280, 720), (1920, 1080)]
 YOLO_METADATA = "../outputs/metadata/yolo_metadata.jsonl"
-ENCODE_GRID = "../outputs/metadata/vcu_encode_grid_roi.json"
+ENCODE_GRID = "../outputs/metadata/vcu_encode_grid.json"
+BITRATE_LEVELS_KBPS = [600.0, 900.0, 1500.0, 2500.0, 4000.0, 6000.0]
 
 # Muc do "ROI QP" cho grid encode offline, gio la ROI qoffset chu khong
 # phai QP tuyet doi nua: 0.0 = khong uu tien vung ROI (giong CBR thuong),
 # am cang nhieu = vung ROI duoc nen NHE hon (net hon) so voi nen.
-# Day khong phai truc action cua env nua.
+# Cac index trong list nay la truc roi_idx cua action trong env.py.
 ROI_QOFFSET_LEVELS = [0.0, -0.3, -0.6]
 
 
@@ -148,7 +149,7 @@ def frame_time(frame_idx, fps):
 
 def encode_segment(input_path, start_frame, end_frame, width, height, roi_box,
                     qoffset, baseline_crf, fps, workdir, tag, preset="veryfast",
-                    seek_mode="fast", verbose=True):
+                    seek_mode="fast", verbose=True, target_bitrate_kbps=None):
     """Encode 1 doan [start_frame, end_frame) o do phan giai (width,height).
 
     QUAN TRONG: dung CRF (rate-control chu dong), KHONG dung constant-QP
@@ -176,7 +177,14 @@ def encode_segment(input_path, start_frame, end_frame, width, height, roi_box,
         "-vf", vf,
         "-frames:v", str(frame_count),
         "-an",
-        "-c:v", "libx264", "-preset", preset, "-crf", str(baseline_crf),
+        "-c:v", "libx264", "-preset", preset,
+    ]
+    if target_bitrate_kbps is None:
+        cmd += ["-crf", str(baseline_crf)]
+    else:
+        br = max(1, int(round(float(target_bitrate_kbps))))
+        cmd += ["-b:v", f"{br}k", "-maxrate", f"{br}k", "-bufsize", f"{max(2 * br, 1)}k"]
+    cmd += [
         "-bf", "0", "-g", str(frame_count),
         "-r", f"{fps:.6f}", "-vsync", "cfr", "-pix_fmt", "yuv420p",
         "-loglevel", "error", out_path,
@@ -254,6 +262,49 @@ def extract_vmaf_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir
     return vmafs
 
 
+def extract_roi_vmaf_per_frame(encoded_path, reference_path, roi_box,
+                               target_w, target_h, workdir, tag, verbose=True):
+    """Tinh VMAF rieng tren union ROI da dung cho addroi.
+
+    Reference duoc scale ve cung resolution encode truoc khi crop. Crop duoc
+    can ve toa do/kich thuoc chan de hop voi pixel format yuv420p.
+    """
+    if roi_box is None:
+        return None
+
+    x, y, w, h = roi_box
+    x = max(0, min((int(x) // 2) * 2, max(target_w - 2, 0)))
+    y = max(0, min((int(y) // 2) * 2, max(target_h - 2, 0)))
+    w = max(2, min((int(w) // 2) * 2, target_w - x))
+    h = max(2, min((int(h) // 2) * 2, target_h - y))
+
+    log_path = os.path.join(workdir, f"roi_vmaf_{tag}.json")
+    crop = f"crop={w}:{h}:{x}:{y}"
+    cmd = [
+        "ffmpeg", "-y", "-i", encoded_path, "-i", reference_path,
+        "-lavfi",
+        f"[0:v]{crop}[enc_roi];"
+        f"[1:v]scale={target_w}:{target_h}:flags=bicubic,{crop}[ref_roi];"
+        f"[enc_roi][ref_roi]libvmaf=log_fmt=json:"
+        f"log_path={ffmpeg_filter_path(log_path)}",
+        "-f", "null", "-", "-loglevel", "error",
+    ]
+    try:
+        run(cmd, verbose=verbose)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Khong tinh duoc ROI VMAF. Kiem tra libvmaf va ROI crop."
+        ) from exc
+
+    with open(log_path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+    return [
+        float(frame["metrics"]["vmaf"])
+        for frame in report.get("frames", [])
+        if "vmaf" in frame.get("metrics", {})
+    ]
+
+
 def extract_psnr_per_frame(encoded_path, reference_path, orig_w, orig_h, workdir,
                            tag, verbose=True):
     log_path = os.path.join(workdir, f"psnr_{tag}.log")
@@ -308,12 +359,14 @@ def _grid_segment_worker(args):
         height,
         roi_box,
         qoffset,
+        target_bitrate_kbps,
         baseline_crf,
         workdir,
         key,
         si,
         res_idx,
-        qp_idx,
+        br_idx,
+        roi_idx,
         metrics,
         preset,
         seek_mode,
@@ -321,11 +374,12 @@ def _grid_segment_worker(args):
         keep_files,
     ) = args
 
-    tag = f"r{res_idx}q{qp_idx}s{si}"
+    tag = f"r{res_idx}b{br_idx}roi{roi_idx}s{si}"
     enc_path = encode_segment(
         input_path, start_f, end_f, width, height, roi_box, qoffset,
         baseline_crf, fps, workdir, tag, preset=preset,
-        seek_mode=seek_mode, verbose=verbose
+        seek_mode=seek_mode, verbose=verbose,
+        target_bitrate_kbps=target_bitrate_kbps
     )
     try:
         bitrates = extract_bitrate_per_frame(enc_path, fps)
@@ -334,8 +388,15 @@ def _grid_segment_worker(args):
             vmafs = extract_vmaf_per_frame(
                 enc_path, ref_path, orig_w, orig_h, workdir, tag, verbose=verbose
             )
+            roi_vmafs = extract_roi_vmaf_per_frame(
+                enc_path, ref_path, roi_box, width, height, workdir, tag,
+                verbose=verbose,
+            )
+            if roi_vmafs is None:
+                roi_vmafs = list(vmafs)
         else:
             vmafs = [0.0] * len(bitrates)
+            roi_vmafs = [0.0] * len(bitrates)
 
         psnrs = None
         if "psnr" in metrics:
@@ -343,7 +404,7 @@ def _grid_segment_worker(args):
                 enc_path, ref_path, orig_w, orig_h, workdir, tag, verbose=verbose
             )
 
-        n = min(len(bitrates), len(vmafs), end_f - start_f)
+        n = min(len(bitrates), len(vmafs), len(roi_vmafs), end_f - start_f)
         if psnrs is not None:
             n = min(n, len(psnrs))
 
@@ -351,7 +412,9 @@ def _grid_segment_worker(args):
         for i in range(n):
             row = {
                 "bitrate_kbps": round(bitrates[i], 2),
+                "target_bitrate_kbps": round(float(target_bitrate_kbps), 2),
                 "vmaf": round(vmafs[i], 2),
+                "roi_vmaf": round(roi_vmafs[i], 2),
             }
             if psnrs is not None:
                 row["psnr"] = round(psnrs[i], 2)
@@ -368,7 +431,8 @@ def _grid_segment_worker(args):
 def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
                 keep_files=False, workdir=None, workers=1, metrics=("vmaf",),
                 preset="veryfast", ref_preset="ultrafast", seek_mode="fast",
-                verbose=False):
+                verbose=False, bitrate_levels_kbps=None):
+    bitrate_levels_kbps = list(bitrate_levels_kbps or BITRATE_LEVELS_KBPS)
     fps, orig_w, orig_h, nb_frames = probe_video(input_path)
     yolo_by_frame = load_yolo_metadata(yolo_metadata_path)
     print(f"[info] input: {input_path} | {orig_w}x{orig_h}@{fps:.3f}fps | "
@@ -376,6 +440,7 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
           f"(~{segment_frames/fps:.2f}s)", file=sys.stderr)
     print(f"[info] ROI qoffset levels: {ROI_QOFFSET_LEVELS} | baseline_crf={baseline_crf}",
           file=sys.stderr)
+    print(f"[info] bitrate levels kbps: {bitrate_levels_kbps}", file=sys.stderr)
     print(f"[info] workers={workers} | metrics={','.join(metrics) or 'none'} | "
           f"preset={preset} | seek_mode={seek_mode}", file=sys.stderr)
 
@@ -420,46 +485,50 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
                     if done % 25 == 0 or done == len(ref_tasks):
                         print(f"[ref] {done}/{len(ref_tasks)}", file=sys.stderr)
 
-        for res_idx, (w, h) in enumerate(RESOLUTIONS):
-            for qp_idx, _ in enumerate(ROI_QOFFSET_LEVELS):
-                grid[f"res{res_idx}_qp{qp_idx}"] = []
+        for res_idx, _ in enumerate(RESOLUTIONS):
+            for br_idx, _ in enumerate(bitrate_levels_kbps):
+                for roi_idx, _ in enumerate(ROI_QOFFSET_LEVELS):
+                    grid[f"res{res_idx}_br{br_idx}_roi{roi_idx}"] = []
 
         tasks = []
         copy_from_base = []
         for res_idx, (w, h) in enumerate(RESOLUTIONS):
             for si, (start_f, end_f) in enumerate(segments):
                 roi_box = roi_cache[(res_idx, si)]
-                for qp_idx, qoffset in enumerate(ROI_QOFFSET_LEVELS):
-                    key = f"res{res_idx}_qp{qp_idx}"
-                    if roi_box is None and qp_idx > 0:
-                        copy_from_base.append((key, f"res{res_idx}_qp0", si))
-                        continue
-                    tasks.append(
-                        (
-                            input_path,
-                            ref_paths.get(si),
-                            start_f,
-                            end_f,
-                            fps,
-                            orig_w,
-                            orig_h,
-                            w,
-                            h,
-                            roi_box,
-                            qoffset,
-                            baseline_crf,
-                            wd,
-                            key,
-                            si,
-                            res_idx,
-                            qp_idx,
-                            metrics,
-                            preset,
-                            seek_mode,
-                            verbose,
-                            keep_files,
+                for br_idx, target_bitrate_kbps in enumerate(bitrate_levels_kbps):
+                    for roi_idx, qoffset in enumerate(ROI_QOFFSET_LEVELS):
+                        key = f"res{res_idx}_br{br_idx}_roi{roi_idx}"
+                        if roi_box is None and roi_idx > 0:
+                            copy_from_base.append((key, f"res{res_idx}_br{br_idx}_roi0", si))
+                            continue
+                        tasks.append(
+                            (
+                                input_path,
+                                ref_paths.get(si),
+                                start_f,
+                                end_f,
+                                fps,
+                                orig_w,
+                                orig_h,
+                                w,
+                                h,
+                                roi_box,
+                                qoffset,
+                                target_bitrate_kbps,
+                                baseline_crf,
+                                wd,
+                                key,
+                                si,
+                                res_idx,
+                                br_idx,
+                                roi_idx,
+                                metrics,
+                                preset,
+                                seek_mode,
+                                verbose,
+                                keep_files,
+                            )
                         )
-                    )
 
         print(f"[encode] {len(tasks)} jobs encode/metric "
               f"(bo qua {len(copy_from_base)} jobs trung lap do segment khong co ROI)",
@@ -484,12 +553,13 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
             segment_rows[(key, si)] = list(segment_rows[(base_key, si)])
 
         for res_idx, _ in enumerate(RESOLUTIONS):
-            for qp_idx, _ in enumerate(ROI_QOFFSET_LEVELS):
-                key = f"res{res_idx}_qp{qp_idx}"
-                rows = []
-                for si in range(len(segments)):
-                    rows.extend(segment_rows[(key, si)])
-                grid[key] = rows
+            for br_idx, _ in enumerate(bitrate_levels_kbps):
+                for roi_idx, _ in enumerate(ROI_QOFFSET_LEVELS):
+                    key = f"res{res_idx}_br{br_idx}_roi{roi_idx}"
+                    rows = []
+                    for si in range(len(segments)):
+                        rows.extend(segment_rows[(key, si)])
+                    grid[key] = rows
     finally:
         if metrics and not keep_files:
             for ref_path in ref_paths.values():
@@ -506,6 +576,7 @@ def build_grid(input_path, yolo_metadata_path, baseline_crf, segment_frames,
         "num_frames": nb_frames,
         "segment_frames": segment_frames,
         "resolutions": RESOLUTIONS,
+        "bitrate_levels_kbps": bitrate_levels_kbps,
         "roi_qoffset_levels": ROI_QOFFSET_LEVELS,
         "baseline_crf": baseline_crf,
         "metrics": list(metrics),
@@ -532,6 +603,18 @@ def parse_metrics(value):
     return metrics
 
 
+def parse_float_list(value):
+    try:
+        values = [float(part.strip()) for part in value.split(",") if part.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Danh sach bitrate phai co dang 600,900,1500"
+        ) from exc
+    if not values or any(v <= 0 for v in values):
+        raise argparse.ArgumentTypeError("Moi bitrate level phai > 0")
+    return values
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -544,6 +627,10 @@ def main():
                           "chu dong), KHONG dung constant-QP, vi da kiem chung constant-QP "
                           "lam addroi/ROI mat tac dung hoan toan. bitrate_ratio trong action "
                           "van dieu chinh tong bitrate qua VBV cap sau khi tra bang.")
+    ap.add_argument("--bitrate-levels", type=parse_float_list,
+                     default=BITRATE_LEVELS_KBPS,
+                     help="Cac muc bitrate kbps de do duong rate-distortion, vd "
+                          "600,900,1500,2500,4000,6000")
     ap.add_argument("--segment-frames", type=int, default=25,
                      help="So frame moi doan (ROI tinh trong 1 doan). 25 ~ 1s o 25fps")
     ap.add_argument("--keep-files", action="store_true")
@@ -575,7 +662,8 @@ def main():
                          workdir=workdir, workers=max(1, args.workers),
                          metrics=args.metrics, preset=args.preset,
                          ref_preset=args.ref_preset, seek_mode=args.seek_mode,
-                         verbose=args.verbose_ffmpeg)
+                         verbose=args.verbose_ffmpeg,
+                         bitrate_levels_kbps=args.bitrate_levels)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
