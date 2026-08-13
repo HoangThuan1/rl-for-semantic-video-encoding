@@ -1,0 +1,5 @@
+[x] Gán QP-offset cho từng ROI bằng một addroi filter cho mỗi bbox.
+[x] Xóa fallback grid/trace cũ, modulo frame và cơ chế sao chép ROI baseline.
+[x] Tạo encode_grid theo từng frame. Khi export theo segment, giữ từng ROI
+    riêng nhưng áp dụng danh sách ROI tĩnh cho toàn segment; ROI động trong
+    cùng GOP cần gắn side-data vào từng AVFrame qua API/GStreamer.

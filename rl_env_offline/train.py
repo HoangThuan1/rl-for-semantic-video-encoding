@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from env import VCUSimEnv
+from env import VCUSimEnv, build_synthetic_trace
 
 
 class QNetwork(nn.Module):
@@ -159,12 +159,19 @@ def train(
     epsilon_decay=0.992,
     target_update_every=10,
     seed=7,
+    synthetic=False,
 ):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    env = VCUSimEnv(trace_path=trace_path, encode_grid_path=encode_grid_path, loop=False)
+    if synthetic and trace_path is not None:
+        raise ValueError("Chi duoc chon mot trong trace_path hoac synthetic")
+    trace = build_synthetic_trace(seed=seed) if synthetic else None
+    env = VCUSimEnv(
+        trace_path=trace_path, trace=trace,
+        encode_grid_path=encode_grid_path, loop=False,
+    )
     qnet = QNetwork(env.STATE_DIM, env.NUM_ACTIONS)
     target_net = QNetwork(env.STATE_DIM, env.NUM_ACTIONS)
     target_net.load_state_dict(qnet.state_dict())
@@ -258,6 +265,8 @@ def train(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace-path", default=None)
+    parser.add_argument("--synthetic", action="store_true",
+                        help="Dung trace mo phong mot cach tuong minh de smoke test")
     parser.add_argument("--encode-grid-path", default=None)
     parser.add_argument("--output", default="dqn_policy.pt")
     parser.add_argument("--resume", default=None, help="Checkpoint cu de tiep tuc train")
@@ -272,9 +281,9 @@ def main():
         resume_path=args.resume,
         num_episodes=args.episodes,
         seed=args.seed,
+        synthetic=args.synthetic,
     )
 
 
 if __name__ == "__main__":
     main()
-

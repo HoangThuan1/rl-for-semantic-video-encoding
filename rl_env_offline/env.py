@@ -11,7 +11,6 @@ thay tung frame.
 
 import json
 import math
-import os
 import random
 from dataclasses import dataclass
 from itertools import product
@@ -65,7 +64,7 @@ def load_trace(path):
 
 
 def build_synthetic_trace(num_frames=240, seed=7):
-    """Fallback de smoke-test khi chua co metadata that tu YOLO/DPU."""
+    """Build an explicit synthetic trace for smoke tests."""
     rng = random.Random(seed)
     trace = []
     bandwidth_levels = [900.0, 1800.0, 3200.0, 5200.0, 7600.0]
@@ -224,15 +223,21 @@ class VCUSimEnv(gym.Env):
         bitrate_cost_weight=DEFAULT_BITRATE_COST_WEIGHT,
     ):
         super().__init__()
-        resolved_trace_path = trace_path
-        resolved_yolo_metadata_path = DEFAULT_YOLO_METADATA_PATH
         if trace is None:
-            if resolved_trace_path and os.path.exists(resolved_trace_path) and os.path.getsize(resolved_trace_path) > 0:
-                trace = load_trace(resolved_trace_path)
-            elif os.path.exists(resolved_yolo_metadata_path) and os.path.getsize(resolved_yolo_metadata_path) > 0:
-                trace = load_yolo_metadata_as_trace(resolved_yolo_metadata_path, max_bitrate_kbps=max_bitrate_kbps)
-            else:
-                trace = build_synthetic_trace()
+            if not trace_path:
+                raise ValueError("Can cung cap trace hoac trace_path")
+            trace = load_trace(trace_path)
+        if not trace:
+            raise ValueError("Trace khong duoc rong")
+        required_trace_fields = {
+            "frame_idx", "semantic_score", "bandwidth", "motion", "roi_area"
+        }
+        for row_index, row in enumerate(trace):
+            missing = required_trace_fields - set(row)
+            if missing:
+                raise ValueError(
+                    f"Trace row {row_index} thieu field: {sorted(missing)}"
+                )
 
         self.trace = trace
         self.n = len(trace)
@@ -245,16 +250,40 @@ class VCUSimEnv(gym.Env):
         self.bitrate_cost_weight = float(bitrate_cost_weight)
 
         self.grid = load_encode_grid(encode_grid_path) if encode_grid_path else None
-        self.grid_qp_levels = self.grid.get("qp_levels") if self.grid else None
         if self.grid is not None:
-            grid_roi_levels = self.grid.get(
-                "roi_qoffset_levels", self.grid_qp_levels
-            )
-            if grid_roi_levels is not None and list(grid_roi_levels) != ROI_QOFFSET_LEVELS:
+            required_grid_fields = {
+                "grid_unit", "num_frames", "resolutions",
+                "bitrate_levels_kbps", "roi_qoffset_levels", "grid",
+            }
+            missing = required_grid_fields - set(self.grid)
+            if missing:
+                raise ValueError(f"Encode grid thieu field: {sorted(missing)}")
+            if self.grid["grid_unit"] != "frame":
+                raise ValueError("Encode grid phai duoc tao theo tung frame")
+            if list(self.grid["resolutions"]) != [list(r) for r in RESOLUTIONS]:
+                raise ValueError("Resolution cua encode grid khong khop env")
+            grid_roi_levels = self.grid["roi_qoffset_levels"]
+            if list(grid_roi_levels) != ROI_QOFFSET_LEVELS:
                 raise ValueError(
                     "ROI levels cua encode grid khong khop env: "
                     f"grid={list(grid_roi_levels)}, env={ROI_QOFFSET_LEVELS}."
                 )
+            grid_num_frames = int(self.grid["num_frames"])
+            if grid_num_frames <= 0:
+                raise ValueError("Encode grid num_frames phai > 0")
+            if not self.grid["bitrate_levels_kbps"]:
+                raise ValueError("Encode grid bitrate_levels_kbps khong duoc rong")
+            for resolution_idx in range(len(RESOLUTIONS)):
+                for bitrate_idx in range(len(self.grid["bitrate_levels_kbps"])):
+                    for roi_idx in range(len(ROI_QOFFSET_LEVELS)):
+                        key = f"res{resolution_idx}_br{bitrate_idx}_roi{roi_idx}"
+                        if key not in self.grid["grid"]:
+                            raise ValueError(f"Encode grid thieu curve: {key}")
+                        if len(self.grid["grid"][key]) != grid_num_frames:
+                            raise ValueError(
+                                f"Encode grid curve {key} co do dai "
+                                f"{len(self.grid['grid'][key])}, can {grid_num_frames}"
+                            )
 
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.STATE_DIM,), dtype=np.float32)
         self.action_space = spaces.Discrete(self.NUM_ACTIONS)
@@ -266,14 +295,14 @@ class VCUSimEnv(gym.Env):
         self.prev_vmaf = 0.0
         self.prev_latency = 0.0
         self.prev_action_idx = 0
-        self.prev_bandwidth = self.trace[0].get("bandwidth", self.max_bitrate * 0.5)
+        self.prev_bandwidth = float(self.trace[0]["bandwidth"])
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.t = 0
         self.current_resolution_idx = 1
         self.current_roi_idx = 0
-        self.prev_bandwidth = self.trace[0].get("bandwidth", self.max_bitrate * 0.5)
+        self.prev_bandwidth = float(self.trace[0]["bandwidth"])
         self.prev_bitrate = min(self.prev_bandwidth * 0.7, self.max_bitrate)
         self.prev_vmaf = 70.0
         self.prev_latency = 0.0
@@ -285,10 +314,10 @@ class VCUSimEnv(gym.Env):
         raw_action = ACTIONS[action_idx]
         row = self.trace[self.t]
 
-        semantic_score = float(row.get("semantic_score", 0.0))
-        bandwidth = float(row.get("bandwidth", self.max_bitrate))
-        motion = float(row.get("motion", self._infer_motion()))
-        roi_area = float(row.get("roi_area", self._infer_roi_area(semantic_score)))
+        semantic_score = float(row["semantic_score"])
+        bandwidth = float(row["bandwidth"])
+        motion = float(row["motion"])
+        roi_area = float(row["roi_area"])
 
         safe_action = self._sanitize_action(raw_action, semantic_score, bandwidth)
         width, height = RESOLUTIONS[safe_action.resolution_idx]
@@ -296,7 +325,7 @@ class VCUSimEnv(gym.Env):
 
         if self.grid is not None:
             actual_bitrate, vmaf, latency, power = self._encode_from_grid(
-                safe_action, target_bitrate, row.get("frame_idx", self.t),
+                safe_action, target_bitrate, row["frame_idx"],
                 semantic_score, roi_area, width, height
             )
         else:
@@ -351,10 +380,10 @@ class VCUSimEnv(gym.Env):
 
     def _get_obs(self):
         row = self.trace[self.t]
-        bandwidth = float(row.get("bandwidth", self.max_bitrate))
+        bandwidth = float(row["bandwidth"])
         bandwidth_norm = np.clip(bandwidth / self.max_bitrate, 0.0, 1.0)
         bitrate_norm = np.clip(self.prev_bitrate / self.max_bitrate, 0.0, 1.0)
-        semantic_norm = np.clip(float(row.get("semantic_score", 0.0)) / SEMANTIC_SCORE_MAX, 0.0, 1.0)
+        semantic_norm = np.clip(float(row["semantic_score"]) / SEMANTIC_SCORE_MAX, 0.0, 1.0)
         return np.array([bandwidth_norm, bitrate_norm, semantic_norm], dtype=np.float32)
 
     def _sanitize_action(self, action, semantic_score, bandwidth):
@@ -381,24 +410,15 @@ class VCUSimEnv(gym.Env):
     def _encode_from_grid(self, action, target_bitrate, frame_idx, semantic_score,
                           roi_area, width, height):
         actual_bitrate = float(np.clip(target_bitrate, 50.0, self.max_bitrate))
-        if "bitrate_levels_kbps" in self.grid:
-            global_vmaf, roi_vmaf = self._interpolate_grid_vmaf(
-                action.resolution_idx,
-                frame_idx,
-                actual_bitrate,
-                roi_idx=action.roi_idx,
-            )
-            semantic_norm = np.clip(semantic_score / SEMANTIC_SCORE_MAX, 0.0, 1.0)
-            roi_weight = semantic_norm * np.clip(roi_area * 3.0, 0.0, 0.75)
-            vmaf = float((1.0 - roi_weight) * global_vmaf + roi_weight * roi_vmaf)
-        else:
-            qp_idx = action.roi_idx
-            key = f"res{action.resolution_idx}_qp{qp_idx}"
-            frames = self.grid["grid"][key]
-            cell = frames[int(frame_idx) % len(frames)]
-            grid_bitrate = float(cell["bitrate_kbps"])
-            grid_vmaf = self._cell_vmaf(cell)
-            vmaf = self._adjust_vmaf_for_bitrate(grid_vmaf, grid_bitrate, actual_bitrate)
+        global_vmaf, roi_vmaf = self._interpolate_grid_vmaf(
+            action.resolution_idx,
+            frame_idx,
+            actual_bitrate,
+            roi_idx=action.roi_idx,
+        )
+        semantic_norm = np.clip(semantic_score / SEMANTIC_SCORE_MAX, 0.0, 1.0)
+        roi_weight = semantic_norm * np.clip(roi_area * 3.0, 0.0, 0.75)
+        vmaf = float((1.0 - roi_weight) * global_vmaf + roi_weight * roi_vmaf)
 
         pixels = width * height
         roi_strength = action.roi_idx / max(len(ROI_QOFFSET_LEVELS) - 1, 1)
@@ -438,36 +458,29 @@ class VCUSimEnv(gym.Env):
         raise KeyError("Encode grid thieu field 'vmaf'. Hay chay lai encode_grid.py de tao grid VMAF.")
 
     @staticmethod
-    def _cell_roi_vmaf(cell, roi_idx):
-        if "roi_vmaf" in cell:
-            return float(cell["roi_vmaf"])
-        if roi_idx == 0:
-            return float(cell["vmaf"])
-        raise KeyError(
-            "Encode grid thieu field 'roi_vmaf' cho ROI action. "
-            "Hay chay lai encode_grid.py ban moi de train policy 27 action."
-        )
+    def _cell_roi_vmaf(cell):
+        if "roi_vmaf" not in cell:
+            raise KeyError("Encode grid thieu field 'roi_vmaf'")
+        return float(cell["roi_vmaf"])
 
     def _interpolate_grid_vmaf(self, resolution_idx, frame_idx, target_bitrate, roi_idx=0):
         points = []
-        bitrate_levels = self.grid.get("bitrate_levels_kbps", [])
+        frame_idx = int(frame_idx)
+        num_frames = int(self.grid["num_frames"])
+        if not 0 <= frame_idx < num_frames:
+            raise IndexError(
+                f"frame_idx={frame_idx} nam ngoai encode grid [0,{num_frames})"
+            )
+        bitrate_levels = self.grid["bitrate_levels_kbps"]
         for br_idx, _ in enumerate(bitrate_levels):
             key = f"res{resolution_idx}_br{br_idx}_roi{roi_idx}"
-            frames = self.grid["grid"].get(key)
-            if not frames:
-                continue
-            cell = frames[int(frame_idx) % len(frames)]
+            frames = self.grid["grid"][key]
+            cell = frames[frame_idx]
             points.append((
                 float(cell["bitrate_kbps"]),
                 self._cell_vmaf(cell),
-                self._cell_roi_vmaf(cell, roi_idx),
+                self._cell_roi_vmaf(cell),
             ))
-
-        if not points:
-            raise KeyError(
-                "Encode grid thieu RD curve cho "
-                f"resolution_idx={resolution_idx}, roi_idx={roi_idx}."
-            )
 
         points.sort(key=lambda p: p[0])
         bitrates = np.array([p[0] for p in points], dtype=np.float32)
@@ -502,19 +515,6 @@ class VCUSimEnv(gym.Env):
             float(np.clip(interp_roi_vmaf, 0.0, 100.0)),
         )
 
-    @staticmethod
-    def _adjust_vmaf_for_bitrate(grid_vmaf, grid_bitrate, actual_bitrate):
-        """Dua VMAF grid ve dung bitrate ma action yeu cau.
-
-        encode_grid do VMAF tai bitrate thuc cua cell. Khi policy chon
-        bitrate_ratio khac, reward phai dung VMAF tuong ung voi actual_bitrate
-        sau action, khong dung nguyen VMAF cua cell baseline.
-        """
-        safe_grid_bitrate = max(float(grid_bitrate), 50.0)
-        safe_actual_bitrate = max(float(actual_bitrate), 50.0)
-        bitrate_delta = 17.0 * math.log10(safe_actual_bitrate / safe_grid_bitrate)
-        return float(np.clip(float(grid_vmaf) + bitrate_delta, 0.0, 100.0))
-
     def _compute_reward(self, vmaf, actual_bitrate):
         qoe_norm = np.clip(vmaf / 100.0, 0.0, 1.0)
         bitrate_cost = actual_bitrate / self.max_bitrate
@@ -528,16 +528,8 @@ class VCUSimEnv(gym.Env):
             "bitrate_penalty_term": float(self.bitrate_cost_weight * bitrate_cost),
         }
 
-    def _infer_motion(self):
-        return 0.25 + 0.25 * math.sin(self.t / 13.0)
-
-    @staticmethod
-    def _infer_roi_area(semantic_score):
-        return float(np.clip(float(semantic_score) / (SEMANTIC_SCORE_MAX * 3.0), 0.0, 0.6))
-
-
 if __name__ == "__main__":
-    env = VCUSimEnv(loop=False)
+    env = VCUSimEnv(trace=build_synthetic_trace(), loop=False)
     obs, _ = env.reset()
     print("obs0:", obs)
     total_reward = 0.0

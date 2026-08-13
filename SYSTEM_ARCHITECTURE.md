@@ -175,24 +175,24 @@ silently skipped. A normal environment input row is therefore:
 
 ### 3.4 Encode grid
 
-`encode_grid.build_grid()` probes the source video, divides it into fixed
-`segment_frames` ranges, and constructs the Cartesian product of:
+`encode_grid.build_grid()` probes the source video and constructs the Cartesian
+product of every source frame with:
 
 - `RESOLUTIONS`: `640x480`, `1280x720`, `1920x1080`;
 - configurable bitrate levels, defaulting to 600, 900, 1500, 2500, 4000, and
   6000 kbps;
 - `ROI_QOFFSET_LEVELS`: `0.0`, `-0.3`, and `-0.6`.
 
-For each segment, `union_roi_for_segment()` takes all YOLO boxes in that
-segment, computes one enclosing union rectangle, scales it to the selected
-resolution, clamps it to the frame, and aligns it for YUV 4:2:0. This static
-rectangle is necessary because the FFmpeg `addroi` invocation used here does
-not change coordinates frame by frame within one encode.
+For each frame, `roi_boxes_for_frames()` scales and YUV-aligns every YOLO box
+independently. `addroi_filter_chain()` emits one `addroi` filter per box, so
+background pixels between objects are no longer included in an enclosing
+rectangle. Overlapping regions retain metadata order; FFmpeg/libx264 gives the
+first ROI priority in an overlap.
 
-`_grid_segment_worker()` invokes `encode_segment()` and collects actual packet
-bitrate, whole-frame VMAF, ROI-crop VMAF, and optional PSNR. When a segment has
-no detections, ROI levels 1 and 2 reuse ROI level 0 rather than running
-equivalent encodes.
+Each worker invokes `encode_frame()` with a one-frame GOP and collects actual
+packet bitrate, whole-frame VMAF, area-weighted per-ROI VMAF, and optional
+PSNR. Every Cartesian-product cell is measured; no result is copied from a
+different ROI level.
 
 The output is one JSON object. Grid arrays are addressed by key and frame
 position:
@@ -202,6 +202,7 @@ position:
   "source_video": "...",
   "fps": 25.0,
   "num_frames": 1500,
+  "grid_unit": "frame",
   "resolutions": [[640, 480], [1280, 720], [1920, 1080]],
   "bitrate_levels_kbps": [600.0, 900.0, 1500.0, 2500.0, 4000.0, 6000.0],
   "roi_qoffset_levels": [0.0, -0.3, -0.6],
@@ -224,12 +225,9 @@ The array index is the frame index; cells do not repeat `frame_idx`.
 
 ### 4.1 Trace selection
 
-`VCUSimEnv.__init__()` chooses its state trace in this order:
-
-1. non-empty `trace_path`;
-2. `outputs/metadata/yolo_metadata.jsonl`, converted in memory and paired with
-   synthetic bandwidth by `load_yolo_metadata_as_trace()`;
-3. the fully synthetic trace from `build_synthetic_trace()`.
+`VCUSimEnv.__init__()` requires either an explicit in-memory `trace` or a
+readable `trace_path`. It does not silently substitute YOLO-only metadata or a
+synthetic trace. Smoke tests can explicitly pass `build_synthetic_trace()`.
 
 The default paths are relative to the current working directory, not to
 `env.py`. Commands in `rl_env_offline/README.md` therefore use explicit `../`
@@ -307,10 +305,9 @@ roi_weight    = semantic_norm * clip(3 * roi_area, 0, 0.75)
 quality_vmaf  = (1 - roi_weight) * global_vmaf + roi_weight * roi_vmaf
 ```
 
-Grid lookup uses `frame_idx % len(curve)`. This prevents an index error but
-also means a longer or mismatched trace silently wraps around the grid. The
-source video, frame numbering, FPS, and frame count should be validated before
-training.
+Grid lookup uses the exact `frame_idx`. Initialization validates the modern
+frame-grid schema, every required curve, and every curve length; an out-of-range
+frame raises an error instead of silently wrapping to another frame.
 
 If no grid is supplied, `_simulate_encode()` estimates bitrate, VMAF, latency,
 and power from resolution, target bitrate, motion, ROI area, semantic score,
@@ -396,7 +393,7 @@ policy for one decision per trace row and stores the sanitized action.
 `(bitrate_ratio, resolution_idx, roi_idx)` tuples. For each group it:
 
 1. averages bandwidth over the group and multiplies it by the bitrate ratio;
-2. builds a static union ROI box from YOLO detections when `roi_idx > 0`;
+2. builds a static list containing each distinct YOLO ROI seen in the group;
 3. invokes `encode_segment_abr()` with libx264 ABR, `maxrate=1.2 * target`,
    `bufsize=2 * target`, no B-frames, and one GOP spanning the group;
 4. measures the encoded packet bitrate with FFprobe;
@@ -419,6 +416,14 @@ Two implementation details are important when interpreting export behavior:
 If any decision requests ROI, the exporter requires YOLO metadata. A requested
 ROI action on a segment with no detections produces no `addroi` filter and is
 reported with `"roi_applied": false`.
+
+FFmpeg's CLI `addroi` coordinates are static during one filter invocation.
+Consequently, the segment exporter applies the segment's ROI list to every
+frame in that physical segment. Exact moving per-frame ROI metadata inside one
+inter-frame GOP requires feeding `AV_FRAME_DATA_REGIONS_OF_INTEREST` per
+`AVFrame` through an API pipeline (or equivalent GStreamer metadata), which is
+outside this CLI exporter. The offline grid avoids that approximation by
+encoding one frame per job.
 
 ## 8. End-to-end run
 
@@ -453,7 +458,7 @@ python3 rl_env_offline/encode_grid.py \
   --yolo-metadata outputs/metadata/yolo_metadata.jsonl \
   --out outputs/metadata/vcu_encode_grid.json \
   --bitrate-levels 600,900,1500,2500,4000,6000 \
-  --segment-frames 25 --workers 4 --metrics vmaf
+  --workers 4 --metrics vmaf
 
 # 6. Train from rl_env_offline so its sibling imports resolve.
 cd rl_env_offline
@@ -489,14 +494,15 @@ repository, model weights, OpenCV, PyTorch, and YOLOv5's Python dependencies.
 - Training and evaluation must use the same `max_bitrate_kbps`, ROI levels,
   action ordering, and grid meaning.
 - `segment_len` controls when resolution and ROI may change in the environment;
-  it is not the `encode_grid.py --segment-frames` value and is not necessarily
-  the physical segment length used by the exporter.
+  it is unrelated to the one-frame jobs used to measure the encode grid and is
+  not necessarily the physical segment length used by the exporter.
 - A grid generated without VMAF cannot provide the training reward used by
   this environment.
-- A grid without `roi_vmaf` is accepted only for `roi_idx=0`; ROI actions raise
-  a clear `KeyError` asking for a regenerated 27-action grid.
-- `VCUSimEnv` validates ROI qoffset values when the grid declares them, but it
-  does not validate source filename, FPS, frame count, or resolution metadata.
+- Every grid cell must contain both `vmaf` and `roi_vmaf`; missing metrics raise
+  an error for every ROI level.
+- `VCUSimEnv` validates frame-grid schema, resolutions, ROI qoffset values,
+  curve presence and lengths. It does not compare the source filename or FPS
+  with the trace.
 - The policy checkpoint validates only state and action dimensions. It does
   not store the trace path, encode-grid identity, `max_bitrate_kbps`, reward
   weights, or `segment_len`; those settings must be tracked externally.
