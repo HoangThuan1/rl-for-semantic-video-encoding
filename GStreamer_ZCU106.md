@@ -45,10 +45,12 @@ python3 gstreamer_edge_pipeline.py --backend sim \
 
 Nếu action đổi, runner đóng một MP4 segment để bảo toàn cấu hình encoder.
 Các segment được chuẩn hóa về `--width` × `--height`; report liệt kê chính xác
-mọi ROI/action. Một output MP4 trực tiếp chỉ được tạo khi có một segment; với
-nhiều segment, output là manifest trong thư mục `*_gst_segments/`, tránh ghép
-MP4 có timestamp/parameter set sai. Dùng `splitmuxsink` hoặc một remuxer board
-phù hợp để đóng gói luồng dài trong deployment.
+mọi ROI/action. Nếu có nhiều segment, runner dùng FFmpeg để decode, nối và
+tái mã hóa chúng thành đúng file `--out`, tránh lỗi timestamp/parameter set do
+stream-copy. Các segment gốc, `manifest.json` và `segments.ffconcat` vẫn được
+giữ trong thư mục `*_gst_segments/` để audit/debug. Có thể chỉ định binary bằng
+`--ffmpeg-bin /duong/dan/toi/ffmpeg`; mặc định runner tìm trong `PATH`, sau đó
+tìm bản static `ffmpeg-*-amd64-static/ffmpeg` đi kèm repository.
 
 Trên ZCU106, cài image Vitis/VVAS đúng phiên bản BSP và kiểm tra plugin trước:
 

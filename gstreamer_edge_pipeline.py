@@ -27,6 +27,8 @@ template; it never pretends that VVAS plugins are installed on this PC.
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 from glob import glob
 from dataclasses import asdict
@@ -92,6 +94,59 @@ def union_roi(detections, width, height):
     x2 = min(width, int(max(b[2] for b in boxes)))
     y2 = min(height, int(max(b[3] for b in boxes)))
     return (x1, y1, max(0, x2 - x1), max(0, y2 - y1)) if x2 > x1 and y2 > y1 else None
+
+
+def resolve_ffmpeg(requested=None):
+    """Return an FFmpeg executable while supporting the bundled static build."""
+    if requested:
+        candidate = shutil.which(requested)
+        if candidate:
+            return candidate
+        path = Path(requested).expanduser().resolve()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+        raise RuntimeError(f"Khong tim thay FFmpeg executable: {requested}")
+
+    candidate = shutil.which("ffmpeg")
+    if candidate:
+        return candidate
+    bundled = sorted(ROOT.glob("ffmpeg-*-amd64-static/ffmpeg"), reverse=True)
+    if bundled:
+        return str(bundled[0].resolve())
+    raise RuntimeError(
+        "Can FFmpeg de ghep cac segment. Cai ffmpeg, dat no trong PATH, "
+        "hoac truyen --ffmpeg-bin /duong/dan/toi/ffmpeg."
+    )
+
+
+def ffconcat_quote(path):
+    """Quote an absolute path for an ffconcat manifest."""
+    return str(Path(path).resolve()).replace("'", "'\\''")
+
+
+def merge_segments(segments, out_path, fps, expected_frames, work, ffmpeg_bin=None):
+    """Re-encode normalized MP4 segments into one timestamp-safe MP4 output."""
+    ffmpeg = resolve_ffmpeg(ffmpeg_bin)
+    concat_path = work / "segments.ffconcat"
+    with open(concat_path, "w", encoding="utf-8") as handle:
+        handle.write("ffconcat version 1.0\n")
+        for segment in segments:
+            handle.write(f"file '{ffconcat_quote(segment)}'\n")
+
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(concat_path),
+        "-an", "-vf", f"fps={fps}", "-frames:v", str(expected_frames),
+        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path),
+    ]
+    completed = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if completed.returncode:
+        detail = completed.stderr.strip() or f"exit code {completed.returncode}"
+        raise RuntimeError(f"FFmpeg khong ghep duoc cac segment: {detail}")
+    if not out_path.is_file() or out_path.stat().st_size == 0:
+        raise RuntimeError(f"FFmpeg khong tao output hop le: {out_path}")
+    return concat_path
 
 
 def zcu106_pipeline_template(args):
@@ -224,20 +279,28 @@ def run_simulation(args):
 
     if not segments:
         raise RuntimeError("Khong doc duoc frame nao tu input")
+    manifest_path = work / "manifest.json"
     if len(segments) == 1:
         os.replace(segments[0], out_path)
         segment_outputs = [str(out_path)]
+        concat_input = None
     else:
-        # mp4mux cannot safely concatenate independently timestamped files. Keep
-        # segments plus a manifest; this is directly streamable with splitmux.
-        out_path = work / "manifest.json"
+        # Keep the original action-boundary segments for audit/debug, but always
+        # create the requested MP4 by decoding and re-encoding them with FFmpeg.
         segment_outputs = [str(p) for p in segments]
-        with open(out_path, "w", encoding="utf-8") as handle:
+        with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump({"segments": segment_outputs}, handle, indent=2)
+        concat_input = merge_segments(
+            segments, out_path, args.fps, frame_idx, work, ffmpeg_bin=args.ffmpeg_bin
+        )
     Path(args.report).resolve().parent.mkdir(parents=True, exist_ok=True)
     with open(args.report, "w", encoding="utf-8") as handle:
         json.dump({"backend": "sim", "roi_encoding": "metadata-contract-only (x264enc fallback)",
-                   "frames": frame_idx, "segments": segment_outputs, "frames_detail": report}, handle,
+                   "frames": frame_idx, "output": str(out_path),
+                   "segments": segment_outputs,
+                   "segment_manifest": str(manifest_path) if len(segments) > 1 else None,
+                   "ffconcat_input": str(concat_input) if concat_input else None,
+                   "frames_detail": report}, handle,
                   ensure_ascii=False, indent=2)
     print(f"[done] {frame_idx} frames, {len(segments)} segment(s). report={args.report}")
     print(f"[output] {out_path}")
@@ -258,6 +321,8 @@ def main():
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--ffmpeg-bin", default=None,
+                    help="FFmpeg executable de ghep segment (mac dinh: tim trong PATH/bundled build)")
     ap.add_argument("--camera-device", default="/dev/video0")
     ap.add_argument("--print-pipeline", action="store_true")
     args = ap.parse_args()
