@@ -242,13 +242,16 @@ Trong repository này, `gstreamer_edge_pipeline.py` đóng vai trò runner:
 Kiến trúc mục tiêu trên board có thể biểu diễn như sau:
 
 ```text
-source -> demux/decode -> VVAS inference -> semantic ROI bridge
-       -> caps/scale -> VCU encoder -> parser/muxer hoặc RTP payloader -> sink
+                                 /-> VVAS inference -> semantic ROI bridge
+source -> demux/decode -> tee --<                         (action theo PTS)
+                                 \-> semantic ROI apply -> VCU encoder
+                                     -> parser/muxer hoặc RTP payloader -> sink
 ```
 
-`semantic ROI bridge` cần thực hiện bốn việc: đọc detection gắn với frame, tạo
-observation đúng như môi trường huấn luyện, chạy policy, và chuyển action sang
-caps/property/ROI metadata mà phiên bản VVAS cụ thể hỗ trợ.
+Nhánh `semantic ROI bridge` đọc detection, tạo observation đúng như môi trường
+huấn luyện, chạy policy và công bố action theo PTS. Nhánh `semantic ROI apply`
+ghép action với đúng frame rồi chuyển nó sang caps/property/ROI metadata mà
+phiên bản VVAS cụ thể hỗ trợ.
 
 ## 11. Nguyên tắc kiểm thử
 

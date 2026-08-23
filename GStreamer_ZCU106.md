@@ -4,10 +4,14 @@ Pipeline mới nằm ở `gstreamer_edge_pipeline.py` và dùng lại nguyên po
 RL trace và JSONL detection của repository. Luồng dữ liệu là:
 
 ```text
-MP4 -> GStreamer decode -> DPU/YOLO metadata -> semantic score + DQN
-    -> {bitrate, resolution, ROI qoffset} -> ROI metadata/QP-map bridge
-    -> GStreamer VCU/x264 encoder -> H.264/MP4 hoặc RTP
+                                      /-> DPU -> semantic score + DQN
+MP4/camera -> GStreamer decode -> tee
+                                      \-> ROI/QP-map apply -> VCU encoder -> RTP
 ```
+
+Trên ZCU106, hai nhánh ghép kết quả bằng PTS của frame: nhánh DPU công bố
+`{bitrate, resolution, ROI qoffset, bbox}`, còn nhánh encoder chờ/nhận quyết
+định tương ứng trước khi gắn metadata và đẩy frame vào VCU.
 
 Trên PC, `--backend sim` chạy decode/encode thật với `x264enc`. Các quyết định
 ROI và qoffset được ghi trong report JSON, là hợp đồng input cho VCU bridge.
@@ -52,6 +56,27 @@ giữ trong thư mục `*_gst_segments/` để audit/debug. Có thể chỉ đ�
 `--ffmpeg-bin /duong/dan/toi/ffmpeg`; mặc định runner tìm trong `PATH`, sau đó
 tìm bản static `ffmpeg-*-amd64-static/ffmpeg` đi kèm repository.
 
+## Đo độ trễ end-to-end
+
+Backend `sim` tự đo bằng monotonic wall clock và ghi vào trường `timing` của
+report JSON. `stage_totals_ms.end_to_end_until_output_ready` bao phủ khởi tạo,
+nạp policy, decode, policy/ROI, encoder drain và ghép output. Thống kê từng
+frame có `mean`, `p50`, `p95`, `max` cho các bước:
+
+- `sample_pull`: chờ frame từ decoder;
+- `buffer_map_copy`: map và sao chép buffer BGR;
+- `policy_env`: DQN inference và cập nhật environment;
+- `encoder_reconfigure`: đóng/mở segment khi action thay đổi;
+- `roi_lookup`: lấy detection và hợp nhất ROI;
+- `encoder_enqueue`: giao buffer cho `appsrc` (không phải latency encode hoàn
+  tất vì encoder chạy bất đồng bộ);
+- `frame_loop`: tổng thời gian xử lý đồng bộ của frame.
+
+`throughput_fps` được tính trên toàn thời gian đến khi output sẵn sàng.
+`realtime_factor = source_duration / wall_time`; giá trị `>= 1` nghĩa là xử lý
+kịp hoặc nhanh hơn realtime. Thời gian thực thi plugin VCU trên ZCU106 cần được
+đo bổ sung bằng timestamp/probe trên board; số đo PC không đại diện cho VCU.
+
 Trên ZCU106, cài image Vitis/VVAS đúng phiên bản BSP và kiểm tra plugin trước:
 
 ```bash
@@ -59,8 +84,9 @@ gst-inspect-1.0 vvas_xinfer vvas_xvcuenc
 python3 gstreamer_edge_pipeline.py --backend zcu106 --print-pipeline
 ```
 
-`semantic_roi_bridge` là phần adapter cần hiện thực theo BSP: nhận detection
-từ `vvas_xinfer`, tạo semantic score giống `env.py`, gọi policy, rồi chuyển
-`bbox + ROI_QOFFSET_LEVELS` thành ROI/QP-map metadata mà `vvas_xvcuenc` của
-image đó công bố. Tên property VVAS thay đổi theo release, nên template không
-hard-code một lệnh được cho là chạy được trên mọi image.
+`semantic_roi_bridge` và `semantic_roi_apply` là cặp adapter cần hiện thực theo
+BSP. Bridge nhận detection từ `vvas_xinfer`, tạo semantic score giống `env.py`,
+gọi policy và công bố quyết định theo PTS. Apply lấy quyết định đúng frame rồi
+chuyển `bbox + ROI_QOFFSET_LEVELS` thành ROI/QP-map metadata mà `vvas_xvcuenc`
+của image đó công bố. Tên property VVAS thay đổi theo release, nên template
+không hard-code một lệnh được cho là chạy được trên mọi image.
