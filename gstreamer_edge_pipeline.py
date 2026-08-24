@@ -8,7 +8,8 @@ the YOLO/DPU-compatible JSONL metadata already produced by this repository.
 The runner deliberately keeps the hardware boundary explicit:
 
   simulation:  GStreamer decode -> DQN -> ROI GstMeta -> x264enc -> MP4
-  ZCU106:      capture -> vvas_xinfer (DPU) -> bridge -> vvas_xvcuenc (VCU)
+  ZCU106:      capture -> tee -> DPU/RL control branch
+                           `-> ROI apply + VCU encode branch
 
 `x264enc` does not consume the generic ROI metadata.  In simulation it is an
 observable contract (also written to --report), not a claim of hardware ROI
@@ -30,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from glob import glob
 from dataclasses import asdict
 from pathlib import Path
@@ -124,6 +126,28 @@ def ffconcat_quote(path):
     return str(Path(path).resolve()).replace("'", "'\\''")
 
 
+def summarize_ms(samples):
+    """Return compact latency statistics without adding a NumPy dependency."""
+    if not samples:
+        return {"count": 0, "mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+    ordered = sorted(samples)
+
+    def percentile(q):
+        position = (len(ordered) - 1) * q
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = position - lower
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+    return {
+        "count": len(ordered),
+        "mean": round(sum(ordered) / len(ordered), 3),
+        "p50": round(percentile(0.50), 3),
+        "p95": round(percentile(0.95), 3),
+        "max": round(ordered[-1], 3),
+    }
+
+
 def merge_segments(segments, out_path, fps, expected_frames, work, ffmpeg_bin=None):
     """Re-encode normalized MP4 segments into one timestamp-safe MP4 output."""
     ffmpeg = resolve_ffmpeg(ffmpeg_bin)
@@ -152,19 +176,25 @@ def merge_segments(segments, out_path, fps, expected_frames, work, ffmpeg_bin=No
 def zcu106_pipeline_template(args):
     """Print only: element/property names vary with Vitis/VVAS release."""
     return f'''# ZCU106 deployment template (validate names with gst-inspect-1.0)
-# DPU output must be converted by semantic_roi_bridge into ROI/QP-map metadata.
+# Two functional branches share decisions by frame PTS.  The control branch
+# publishes DPU/RL decisions; the encode branch consumes them and attaches the
+# ROI/QP-map metadata before VCU encoding.
 v4l2src device={args.camera_device} ! video/x-raw,format=NV12,width={args.width},height={args.height},framerate={args.fps}/1 ! \\
   tee name=t \\
-  t. ! queue ! vvas_xinfer config-location=<dpu_infer.json> ! semantic_roi_bridge \\
-      policy={args.policy} trace={args.trace} ! queue ! \\
+  t. ! queue leaky=downstream max-size-buffers=2 ! \\
+      vvas_xinfer config-location=<dpu_infer.json> ! \\
+      semantic_roi_bridge name=roi_controller policy={args.policy} trace={args.trace} ! \\
+      fakesink sync=false \\
+  t. ! queue ! semantic_roi_apply controller=roi_controller ! \\
       vvas_xvcuenc bitrate=<RL_TARGET_KBPS> control-rate=constant ! h264parse ! \\
-      rtph264pay pt=96 config-interval=1 ! udpsink host=<receiver-ip> port=5004 \\
-  t. ! queue ! fakesink
+      rtph264pay pt=96 config-interval=1 ! udpsink host=<receiver-ip> port=5004
 
-# semantic_roi_bridge is the board-specific adapter to implement.  It receives
-# detections {{bbox,class_id,confidence}}, computes semantic score exactly as
-# rl_env_offline/env.py, executes the DQN, and applies ROI/QP-map metadata that
-# your installed vvas_xvcuenc advertises.  Do not copy this command verbatim
+# semantic_roi_bridge and semantic_roi_apply are the board-specific adapter
+# pair to implement.  The bridge receives detections {{bbox,class_id,confidence}},
+# computes the semantic score exactly as rl_env_offline/env.py, runs the DQN,
+# and publishes each action keyed by PTS.  semantic_roi_apply waits for the
+# matching action, applies bitrate/resolution and attaches the ROI/QP-map meta
+# advertised by the installed vvas_xvcuenc.  Do not copy this command verbatim
 # until gst-inspect confirms the VVAS element/property names for the BSP.'''
 
 
@@ -211,6 +241,7 @@ class EncoderSegment:
 
 
 def run_simulation(args):
+    run_started_ns = time.perf_counter_ns()
     sys.path.insert(0, str(ROOT / "rl_env_offline"))
     from env import VCUSimEnv
     from export_encoded_video import greedy_action, load_policy
@@ -223,7 +254,9 @@ def run_simulation(args):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     work = out_path.parent / (out_path.stem + "_gst_segments")
     work.mkdir(exist_ok=True)
+    setup_completed_ns = time.perf_counter_ns()
 
+    media_path_started_ns = time.perf_counter_ns()
     decoder = Gst.parse_launch(
         f'filesrc location="{Path(args.input).resolve()}" ! decodebin ! videoconvert ! '
         'video/x-raw,format=BGR ! appsink name=frames sync=false max-buffers=2 drop=false'
@@ -234,11 +267,16 @@ def run_simulation(args):
     encoder = None
     current_action = None
     segments, report, frame_idx = [], [], 0
+    frame_timings = []
     try:
         while frame_idx < env.n and (not args.max_frames or frame_idx < args.max_frames):
+            frame_started_ns = time.perf_counter_ns()
+            pull_started_ns = time.perf_counter_ns()
             sample = sink.emit("pull-sample")
+            pull_completed_ns = time.perf_counter_ns()
             if sample is None:
                 break
+            copy_started_ns = time.perf_counter_ns()
             caps = sample.get_caps().get_structure(0)
             width, height = caps.get_value("width"), caps.get_value("height")
             buffer = sample.get_buffer()
@@ -247,10 +285,14 @@ def run_simulation(args):
                 raise RuntimeError("Khong map duoc frame BGR tu GStreamer")
             data = bytes(mapped.data)
             buffer.unmap(mapped)
+            copy_completed_ns = time.perf_counter_ns()
 
+            policy_started_ns = time.perf_counter_ns()
             action_idx = greedy_action(qnet, state)
             _, _, terminated, truncated, info = env.step(action_idx)
             action = info["safe_action"]
+            policy_completed_ns = time.perf_counter_ns()
+            reconfigure_started_ns = time.perf_counter_ns()
             if action != current_action:
                 if encoder:
                     encoder.close()
@@ -259,15 +301,31 @@ def run_simulation(args):
                                          action, args.fps, args.max_bitrate_kbps)
                 segments.append(seg_path)
                 current_action = action
+            reconfigure_completed_ns = time.perf_counter_ns()
 
+            roi_started_ns = time.perf_counter_ns()
             row = detections.get(frame_idx, {})
             roi = union_roi(row.get("detections", []), width, height) if action.roi_idx else None
+            roi_completed_ns = time.perf_counter_ns()
             # Metadata is included in the report.  A production VCU adapter maps
             # this ROI + qoffset to the encoder's hardware QP map.
+            enqueue_started_ns = time.perf_counter_ns()
             encoder.push(data, frame_idx * Gst.SECOND // args.fps, Gst.SECOND // args.fps, roi=roi)
+            enqueue_completed_ns = time.perf_counter_ns()
+            timing_ms = {
+                "sample_pull": (pull_completed_ns - pull_started_ns) / 1e6,
+                "buffer_map_copy": (copy_completed_ns - copy_started_ns) / 1e6,
+                "policy_env": (policy_completed_ns - policy_started_ns) / 1e6,
+                "encoder_reconfigure": (reconfigure_completed_ns - reconfigure_started_ns) / 1e6,
+                "roi_lookup": (roi_completed_ns - roi_started_ns) / 1e6,
+                "encoder_enqueue": (enqueue_completed_ns - enqueue_started_ns) / 1e6,
+                "frame_loop": (enqueue_completed_ns - frame_started_ns) / 1e6,
+            }
+            frame_timings.append(timing_ms)
             report.append({"frame_idx": frame_idx, "action": asdict(action), "target_bitrate_kbps": info["target_bitrate"],
                            "semantic_score": float(env.trace[frame_idx].get("semantic_score", 0)),
-                           "roi": roi, "roi_qoffset": info["roi_qoffset"]})
+                           "roi": roi, "roi_qoffset": info["roi_qoffset"],
+                           "timing_ms": {key: round(value, 3) for key, value in timing_ms.items()}})
             frame_idx += 1
             state = env._get_obs() if not (terminated or truncated) else state
             if terminated or truncated:
@@ -276,9 +334,11 @@ def run_simulation(args):
         decoder.set_state(Gst.State.NULL)
         if encoder:
             encoder.close()
+    media_path_completed_ns = time.perf_counter_ns()
 
     if not segments:
         raise RuntimeError("Khong doc duoc frame nao tu input")
+    finalize_started_ns = time.perf_counter_ns()
     manifest_path = work / "manifest.json"
     if len(segments) == 1:
         os.replace(segments[0], out_path)
@@ -293,6 +353,25 @@ def run_simulation(args):
         concat_input = merge_segments(
             segments, out_path, args.fps, frame_idx, work, ffmpeg_bin=args.ffmpeg_bin
         )
+    output_ready_ns = time.perf_counter_ns()
+    timing_summary = {
+        "definition": "PC wall-clock latency; encoder_enqueue measures appsrc handoff, while media_path includes encoder EOS drain",
+        "stage_totals_ms": {
+            "setup": round((setup_completed_ns - run_started_ns) / 1e6, 3),
+            "media_path_with_encoder_drain": round((media_path_completed_ns - media_path_started_ns) / 1e6, 3),
+            "output_finalize": round((output_ready_ns - finalize_started_ns) / 1e6, 3),
+            "end_to_end_until_output_ready": round((output_ready_ns - run_started_ns) / 1e6, 3),
+        },
+        "per_frame_ms": {
+            key: summarize_ms([row[key] for row in frame_timings])
+            for key in frame_timings[0]
+        },
+    }
+    elapsed_seconds = (output_ready_ns - run_started_ns) / 1e9
+    source_seconds = frame_idx / args.fps
+    timing_summary["throughput_fps"] = round(frame_idx / elapsed_seconds, 3)
+    timing_summary["source_duration_seconds"] = round(source_seconds, 3)
+    timing_summary["realtime_factor"] = round(source_seconds / elapsed_seconds, 3)
     Path(args.report).resolve().parent.mkdir(parents=True, exist_ok=True)
     with open(args.report, "w", encoding="utf-8") as handle:
         json.dump({"backend": "sim", "roi_encoding": "metadata-contract-only (x264enc fallback)",
@@ -300,10 +379,13 @@ def run_simulation(args):
                    "segments": segment_outputs,
                    "segment_manifest": str(manifest_path) if len(segments) > 1 else None,
                    "ffconcat_input": str(concat_input) if concat_input else None,
+                   "timing": timing_summary,
                    "frames_detail": report}, handle,
                   ensure_ascii=False, indent=2)
     print(f"[done] {frame_idx} frames, {len(segments)} segment(s). report={args.report}")
     print(f"[output] {out_path}")
+    print(f"[timing] end-to-end={elapsed_seconds:.3f}s throughput={timing_summary['throughput_fps']:.2f}fps "
+          f"realtime-factor={timing_summary['realtime_factor']:.3f}x")
 
 
 def main():

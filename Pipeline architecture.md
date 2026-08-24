@@ -51,18 +51,25 @@ lượng ROI của VCU phần cứng.
 ## Backend ZCU106 (`--backend zcu106`)
 
 ```text
-v4l2src -> tee -> vvas_xinfer -> semantic_roi_bridge -> vvas_xvcuenc
-                                                     -> H.264/RTP
+                         /-> vvas_xinfer -> semantic_roi_bridge -> fakesink
+v4l2src -> tee --------<                    (publish action by frame PTS)
+                         \-> semantic_roi_apply -> vvas_xvcuenc -> H.264/RTP
+                             (consume action by frame PTS)
 ```
 
-- `vvas_xinfer` chạy mô hình trên DPU và sinh detection.
-- `semantic_roi_bridge` là adapter phụ thuộc BSP: tính semantic score, gọi DQN,
-  rồi chuyển bounding box và ROI qoffset sang ROI/QP-map metadata của VCU.
+- Nhánh điều khiển chạy `vvas_xinfer` trên DPU. `semantic_roi_bridge` tính
+  semantic score, gọi DQN và công bố action theo PTS của frame; `fakesink` chỉ
+  kết thúc nhánh sau khi metadata đã được xử lý.
+- Nhánh mã hóa giữ đường video độc lập. `semantic_roi_apply` lấy đúng action
+  theo PTS, cập nhật bitrate/resolution và chuyển bounding box cùng ROI qoffset
+  sang ROI/QP-map metadata của VCU.
 - `vvas_xvcuenc` mã hóa H.264 bằng phần cứng; tên element và property phải được
   xác nhận bằng `gst-inspect-1.0` trên đúng Vitis/VVAS image.
 
 Backend ZCU106 hiện chỉ in template tích hợp. Nó không giả định plugin VVAS của
-một phiên bản BSP cụ thể đã tồn tại trên máy PC.
+một phiên bản BSP cụ thể đã tồn tại trên máy PC. Hai adapter phải đồng bộ bằng
+PTS và có chính sách timeout/drop rõ ràng để nhánh DPU chậm không làm sai action
+của frame ở nhánh encoder.
 
 ## Artefact đầu ra
 
